@@ -1,3 +1,7 @@
+## v0.3.2 — 2026-05-14
+
+Fix a crash on the overlay's first open on macOS 26 when several windows are visible. The capture-setup calls used by each tile are now serialized so the framework no longer sees overlapping inits.
+
 ## v0.3.1 — 2026-05-06
 
 Fix WhatsApp tile label showing as just "a" — strip Unicode formatting characters (e.g. U+200E LRM in WhatsApp's display name) before deriving the letter-pick prefix.

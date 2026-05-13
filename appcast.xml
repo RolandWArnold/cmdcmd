@@ -6,15 +6,15 @@
         <description>cmdcmd updates</description>
         <language>en</language>
         <item>
-            <title>v0.3.1</title>
-            <sparkle:version>13</sparkle:version>
-            <sparkle:shortVersionString>0.3.1</sparkle:shortVersionString>
+            <title>v0.3.2</title>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>0.3.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description><![CDATA[<p>Fix WhatsApp tile label showing as just "a" — strip Unicode formatting characters (e.g. U+200E LRM in WhatsApp's display name) before deriving the letter-pick prefix.</p>]]></description>
-            <pubDate>Wed, 06 May 2026 22:29:53 +0000</pubDate>
-            <enclosure url="https://github.com/peterp/cmdcmd/releases/download/v0.3.1/cmdcmd.zip"
-                       sparkle:edSignature="+gMaLjdld4Y4jtzi3BizfXJmKHyHnPzAB9y/VDxPMpTBklce1HDYzDQU8WRjuB8lqWBXHk+y95RW2f1VqoBqAA=="
-                       length="1683364"
+            <description><![CDATA[<p>Fix a crash on the overlay's first open on macOS 26 when several windows are visible. The capture-setup calls used by each tile are now serialized so the framework no longer sees overlapping inits.</p>]]></description>
+            <pubDate>Wed, 13 May 2026 22:37:32 +0000</pubDate>
+            <enclosure url="https://github.com/peterp/cmdcmd/releases/download/v0.3.2/cmdcmd.zip"
+                       sparkle:edSignature="WseY/lMibN7yYsqV+NMN25d7DJxRYF4YvLrYajNyAonbPZp8vBLjQN9SVSnzl3hUQrpvHEK26rPL1CBj/HBGCQ=="
+                       length="1702311"
                        type="application/octet-stream" />
         </item>
     </channel>
