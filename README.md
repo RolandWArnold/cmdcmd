@@ -6,6 +6,10 @@
 
 A keyboard-first window switcher for macOS. Press both ⌘ keys at once to fan every visible window out into a grid of live previews, then jump straight to the one you want.
 
+<p align="center">
+  <img src="cmdcmd.webp" alt="cmdcmd demo">
+</p>
+
 Requires macOS 14+.
 
 ## Trigger
