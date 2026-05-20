@@ -12,6 +12,14 @@ A keyboard-first window switcher for macOS. Press both ⌘ keys at once to fan e
 
 Requires macOS 14+.
 
+## Install
+
+```sh
+brew install --cask peterp/tap/cmdcmd
+```
+
+Or download `cmdcmd.zip` from the [latest release](https://github.com/peterp/cmdcmd/releases/latest), unzip it, and drag `cmdcmd.app` to `/Applications`.
+
 ## Trigger
 
 **⌘ + ⌘** — tap left and right Command at the same time (no other key in between). Tap again, or press `esc`, to dismiss.
@@ -100,7 +108,7 @@ Cut a release with:
 ./release.sh
 ```
 
-That bumps the version (highest level across pending changesets wins), prepends a `CHANGELOG.md` section, regenerates `appcast.xml`, builds + signs the zip with the Sparkle key from 1Password, tags, pushes, and creates the GitHub release. Pending `.changeset/*.md` files are removed by the same commit. See `.changeset/HOWTO.md` for the file format.
+That bumps the version (highest level across pending changesets wins), prepends a `CHANGELOG.md` section, regenerates `appcast.xml`, builds + signs the zip with the Sparkle key from 1Password, tags, pushes, creates the GitHub release, and updates the Homebrew tap. Pending `.changeset/*.md` files are removed by the same commit. See `.changeset/HOWTO.md` for the file format.
 
 ## Permissions
 

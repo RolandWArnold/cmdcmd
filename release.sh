@@ -76,6 +76,7 @@ mv "$TMP" CHANGELOG.md
 # Build + zip.
 ./build-app.sh release
 ditto -c -k --keepParent cmdcmd.app cmdcmd.zip
+SHA256=$(shasum -a 256 cmdcmd.zip | awk '{print $1}')
 
 # Sign with Sparkle key from 1Password.
 SPARKLE_KEY_REF="${SPARKLE_KEY_REF:-op://Private/cmdcmd Sparkle key/password}"
@@ -126,6 +127,9 @@ $NOTES
 
 ## Install
 
+Homebrew: \`brew install --cask peterp/tap/cmdcmd\`
+
+Manual:
 1. Download \`cmdcmd.zip\` and unzip.
 2. Drag \`cmdcmd.app\` to \`/Applications\`.
 3. Strip quarantine: \`xattr -dr com.apple.quarantine /Applications/cmdcmd.app\` (or System Settings → Privacy & Security → Open Anyway after the first failed launch).
@@ -135,5 +139,61 @@ Existing v0.1.3+ users will be offered this update automatically via Sparkle.
 
 Requires macOS 14+. Apple-silicon build."
 gh release create "v$NEXT" cmdcmd.zip --title "v$NEXT" --notes "$RELEASE_BODY"
+
+# Update Homebrew tap.
+if [ "${SKIP_HOMEBREW_TAP:-0}" = "1" ]; then
+    echo "Skipping Homebrew tap update."
+else
+    TAP_REPO="${TAP_REPO:-peterp/homebrew-tap}"
+    TAP_DIR=$(mktemp -d)
+    cleanup_tap() { rm -rf "$TAP_DIR"; }
+    trap cleanup_tap EXIT
+
+    gh repo clone "$TAP_REPO" "$TAP_DIR" -- --quiet
+    mkdir -p "$TAP_DIR/Casks"
+    cat > "$TAP_DIR/Casks/cmdcmd.rb" <<EOF
+cask "cmdcmd" do
+  version "$NEXT"
+  sha256 "$SHA256"
+
+  url "https://github.com/peterp/cmdcmd/releases/download/v#{version}/cmdcmd.zip"
+  name "cmdcmd"
+  desc "Keyboard-first window switcher"
+  homepage "https://github.com/peterp/cmdcmd"
+
+  auto_updates true
+  depends_on arch: :arm64
+  depends_on macos: ">= :sonoma"
+
+  app "cmdcmd.app"
+
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/cmdcmd.app"]
+  end
+
+  uninstall quit: "com.p4p8.cmdcmd"
+
+  zap trash: [
+    "~/Library/Application Support/cmdcmd",
+    "~/Library/Preferences/com.p4p8.cmdcmd.plist",
+  ]
+end
+EOF
+
+    (
+        cd "$TAP_DIR"
+        git config user.name "${TAP_GIT_NAME:-github-actions[bot]}"
+        git config user.email "${TAP_GIT_EMAIL:-github-actions[bot]@users.noreply.github.com}"
+        git add Casks/cmdcmd.rb
+        if git diff --cached --quiet; then
+            echo "Homebrew tap already up to date."
+        else
+            git commit -m "Update cmdcmd to $NEXT"
+            git push
+            echo "Updated Homebrew tap $TAP_REPO."
+        fi
+    )
+fi
 
 echo "Released v$NEXT."
