@@ -1,3 +1,13 @@
+## v0.4.1 — 2026-05-26
+
+Animate overlay tiles between their grid positions and each window's real screen frame for smoother show and dismiss transitions.
+
+Thanks to Eric Clemmons for the animation work.
+
+Add Homebrew tap install support.
+
+Add an animationSpeed config option and Settings slider to adjust overlay animation speed.
+
 ## v0.4.0 — 2026-05-14
 
 Replace per-window `SCStream` with polled `CGSHWCaptureWindowList` (private SkyLight) for live tile previews. Window enumeration also moves off ScreenCaptureKit to `CGWindowListCopyWindowInfo`, eliminating the SCK setup race fixed in #18 and dropping the CPU/GPU cost of N concurrent streams. Screen Recording permission is still required — current macOS gates `CGSHWCaptureWindowList` on it and still attributes capture to the app via the menu-bar indicator. See issue #21.

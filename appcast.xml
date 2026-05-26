@@ -6,15 +6,15 @@
         <description>cmdcmd updates</description>
         <language>en</language>
         <item>
-            <title>v0.4.0</title>
-            <sparkle:version>15</sparkle:version>
-            <sparkle:shortVersionString>0.4.0</sparkle:shortVersionString>
+            <title>v0.4.1</title>
+            <sparkle:version>16</sparkle:version>
+            <sparkle:shortVersionString>0.4.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description><![CDATA[<p>Replace per-window `SCStream` with polled `CGSHWCaptureWindowList` (private SkyLight) for live tile previews. Window enumeration also moves off ScreenCaptureKit to `CGWindowListCopyWindowInfo`, eliminating the SCK setup race fixed in #18 and dropping the CPU/GPU cost of N concurrent streams. Screen Recording permission is still required — current macOS gates `CGSHWCaptureWindowList` on it and still attributes capture to the app via the menu-bar indicator. See issue #21.</p>]]></description>
-            <pubDate>Thu, 14 May 2026 00:17:20 +0000</pubDate>
-            <enclosure url="https://github.com/peterp/cmdcmd/releases/download/v0.4.0/cmdcmd.zip"
-                       sparkle:edSignature="lV8jgYnWOZ78+tPad3QJw4RFMI8qtfvnrXXEejSnr6v3WJ48JAqfzc0ztcQp3gA4VKS3HoZGvLKUayPT3C+vDw=="
-                       length="1682914"
+            <description><![CDATA[<p>Animate overlay tiles between their grid positions and each window's real screen frame for smoother show and dismiss transitions.<br><br>Thanks to Eric Clemmons for the animation work.</p><p>Add Homebrew tap install support.</p><p>Add an animationSpeed config option and Settings slider to adjust overlay animation speed.</p>]]></description>
+            <pubDate>Tue, 26 May 2026 21:49:05 +0000</pubDate>
+            <enclosure url="https://github.com/peterp/cmdcmd/releases/download/v0.4.1/cmdcmd.zip"
+                       sparkle:edSignature="rlDeDJmmZjam2c+CvSeEhyLYxbxOSrdo+BGjTe3o0yNriLxJYO/elTSZD6d9woj/S89kLGCygI33miER91wqDg=="
+                       length="1692773"
                        type="application/octet-stream" />
         </item>
     </channel>
