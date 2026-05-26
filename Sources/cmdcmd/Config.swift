@@ -13,6 +13,7 @@ enum TilePicks: String, Codable, CaseIterable {
 
 struct Config: Codable {
     var animations: Bool
+    var animationSpeed: Double?
     var trigger: String?
     var bindings: [String: Action]
     var livePreviews: Bool?
@@ -21,6 +22,10 @@ struct Config: Codable {
     var usageOrdering: Bool?
     var tilePicks: TilePicks?
 
+    var animationSpeedOrDefault: Double {
+        guard let animationSpeed, animationSpeed.isFinite else { return 1.0 }
+        return min(4.0, max(0.25, animationSpeed))
+    }
     var triggerSpec: String { trigger ?? "cmd-cmd" }
     var livePreviewsEnabled: Bool { livePreviews ?? true }
     var displayModeOrDefault: DisplayMode { displayMode ?? .dock }
@@ -28,7 +33,7 @@ struct Config: Codable {
     var usageOrderingEnabled: Bool { usageOrdering ?? false }
     var tilePicksMode: TilePicks { tilePicks ?? .letters }
 
-    static let `default` = Config(animations: true, trigger: nil, bindings: [:], livePreviews: nil, displayMode: nil, letterJump: nil, usageOrdering: nil, tilePicks: nil)
+    static let `default` = Config(animations: true, animationSpeed: nil, trigger: nil, bindings: [:], livePreviews: nil, displayMode: nil, letterJump: nil, usageOrdering: nil, tilePicks: nil)
 
     static var fileURL: URL {
         URL(fileURLWithPath: NSHomeDirectory())
@@ -356,6 +361,10 @@ struct Config: Codable {
         lines.append("{")
         lines.append("  // Animate the show / pick zoom transitions. Set to false for instant.")
         lines.append("  \"animations\": true,")
+        lines.append("")
+        lines.append("  // Animation speed multiplier. 1.0 is normal, 2.0 is twice as fast,")
+        lines.append("  // 0.5 is half speed. Values are clamped from 0.25 to 4.0.")
+        lines.append("  \"animationSpeed\": 1.0,")
         lines.append("")
         lines.append("  // Live tile previews. Set to false for static screenshots only —")
         lines.append("  // faster and lighter, especially with many windows open.")

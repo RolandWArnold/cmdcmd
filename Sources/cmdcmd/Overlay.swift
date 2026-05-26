@@ -6,6 +6,7 @@ private func _AXUIElementGetWindow(_ axEl: AXUIElement, _ wid: UnsafeMutablePoin
 final class Overlay {
     private var window: NSWindow?
     private var view: OverlayView?
+    private var backgroundLayer: CALayer?
     private var visible = false
     private var allTiles: [Tile] = []
     private var tiles: [Tile] = []
@@ -174,25 +175,38 @@ final class Overlay {
         let w = window ?? makeWindow(frame: visibleFrame)
         window = w
         w.setFrame(visibleFrame, display: false)
-        if config.animations {
-            w.alphaValue = 0
-        } else {
-            w.alphaValue = 1
-        }
+        w.alphaValue = 1
         let tWindow = CFAbsoluteTimeGetCurrent()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         installTiles(candidates: candidates)
+        // Match each tile's z-order to its source window's WindowServer
+        // z-order (candidates[0] is front-most) so tiles overlap correctly
+        // at the start of show / end of dismiss instead of shuffling past
+        // each other mid-flight.
+        for (i, c) in candidates.enumerated() {
+            let z = CGFloat(candidates.count - i)
+            if let t = allTiles.first(where: { $0.window.windowID == c.windowID }) {
+                t.layer.zPosition = z
+            }
+        }
+        // Capture each tile's final grid frame, then teleport to its source
+        // window frame so animateShow can fly all tiles in Exposé-style.
+        let gridFrames = tiles.map { $0.layer.frame }
+        if config.animations {
+            backgroundLayer?.opacity = 0
+            for t in tiles {
+                let src = Self.contentLocalRect(forSourceCGFrame: t.window.frame, overlayWindow: w)
+                t.setFrame(src)
+            }
+        }
         CATransaction.commit()
         let tTiles = CFAbsoluteTimeGetCurrent()
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if let v = view { w.makeFirstResponder(v) }
         let tFront = CFAbsoluteTimeGetCurrent()
-        if config.animations {
-            w.fadeInAndUp(distance: 0, duration: 0.10)
-        }
-        animateShowFromFocused(in: w)
+        animateShow(gridFrames: gridFrames)
         let tEnd = CFAbsoluteTimeGetCurrent()
         Log.debug(String(format: "render: filter=%.1f window=%.1f(new=%@) installTiles=%.1f orderFront+activate=%.1f animate=%.1f total=%.1f n=%d",
                          (tFilter - t0) * 1000,
@@ -258,8 +272,16 @@ final class Overlay {
         }
     }
 
-    private static let smoothEasing = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.2, 1)
-    private static let pickDuration: Double = 0.16
+    private static let smoothEasing = CAMediaTimingFunction(controlPoints: 0.42, 0, 0.58, 1)
+    private static let baseShowDuration: TimeInterval = 0.2
+    private static let baseDismissDuration: TimeInterval = 0.2
+    private static let baseHideDuration: TimeInterval = 0.10
+    private static let baseLayoutDuration: TimeInterval = 0.18
+    private static let basePeekDuration: TimeInterval = 0.12
+
+    private func animationDuration(_ base: TimeInterval) -> TimeInterval {
+        base / config.animationSpeedOrDefault
+    }
 
     private func suspendFrames() {
         for t in allTiles { t.suppressFrames = true }
@@ -272,34 +294,49 @@ final class Overlay {
         }
     }
 
-    private func animateShowFromFocused(in w: NSWindow) {
-        guard tiles.indices.contains(selectedIndex),
-              let bounds = w.contentView?.bounds, bounds.width > 0 else { return }
-        guard config.animations else { return }
-        let tile = tiles[selectedIndex]
-        let gridFrame = tile.layer.frame
-
+    private func animateShow(gridFrames: [CGRect]) {
+        guard config.animations, !tiles.isEmpty, gridFrames.count == tiles.count else {
+            updateSelection()
+            return
+        }
         suspendFrames()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        tile.highlight = .none
-        tile.layer.zPosition = 1
-        tile.setFrame(bounds)
-        CATransaction.commit()
+        // Make sure the teleport-to-source state from renderOverlay is on
+        // screen before we kick off the fly-in animation.
         CATransaction.flush()
 
+        let duration = animationDuration(Self.baseShowDuration)
         CATransaction.begin()
-        CATransaction.setAnimationDuration(Self.pickDuration)
+        CATransaction.setAnimationDuration(duration)
         CATransaction.setAnimationTimingFunction(Self.smoothEasing)
-        tile.setFrame(gridFrame)
+        for (i, t) in tiles.enumerated() {
+            t.highlight = .none
+            t.setFrame(gridFrames[i])
+        }
+        backgroundLayer?.opacity = 1
         CATransaction.commit()
 
-        resumeFrames(after: Self.pickDuration)
+        resumeFrames(after: duration)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pickDuration) { [weak self, weak tile] in
-            tile?.layer.zPosition = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             self?.updateSelection()
         }
+    }
+
+    /// Convert a CGWindowList-style frame (top-left origin, anchored at the
+    /// primary display) into the overlay content view's local coordinate
+    /// space (bottom-left origin, relative to the overlay window).
+    private static func contentLocalRect(forSourceCGFrame cg: CGRect, overlayWindow w: NSWindow) -> CGRect {
+        guard let primary = NSScreen.screens.first else { return cg }
+        let primaryMaxY = primary.frame.maxY
+        let nsX = cg.origin.x
+        let nsY = primaryMaxY - cg.origin.y - cg.height
+        let winFrame = w.frame
+        return CGRect(
+            x: nsX - winFrame.origin.x,
+            y: nsY - winFrame.origin.y,
+            width: cg.width,
+            height: cg.height
+        )
     }
 
 private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) -> Bool {
@@ -618,12 +655,21 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         isZoomed = false
         savedFrames = []
         let clearLayers = { [weak self] in
-            if let root = self?.window?.contentView?.layer {
-                root.sublayers?.forEach { $0.removeFromSuperlayer() }
+            guard let self else { return }
+            if let root = self.window?.contentView?.layer {
+                root.sublayers?.forEach { layer in
+                    if layer !== self.backgroundLayer { layer.removeFromSuperlayer() }
+                }
             }
+            // Reset the backdrop so the next show starts opaque again.
+            // pick() animates this to 0 and we never animate it back up.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.backgroundLayer?.opacity = 1
+            CATransaction.commit()
         }
         if animate, let w {
-            w.fadeOutAndDown(distance: 0, duration: 0.10) { [weak self] in
+            w.fadeOutAndDown(distance: 0, duration: animationDuration(Self.baseHideDuration)) { [weak self] in
                 guard let self else { return }
                 if !self.visible {
                     w.orderOut(nil)
@@ -697,38 +743,86 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         prevPickedWindowID = windowID
         isPicking = true
 
-        raiseAXWindow(pid: pid, windowID: windowID, title: title)
-        if let app = NSRunningApplication(processIdentifier: pid) {
-            app.activate()
-        }
-        raiseAXWindow(pid: pid, windowID: windowID, title: title)
-
-        guard let w = window, let bounds = w.contentView?.bounds, config.animations else {
+        guard let w = window, config.animations else {
+            raiseAXWindow(pid: pid, windowID: windowID, title: title)
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                app.activate()
+            }
+            raiseAXWindow(pid: pid, windowID: windowID, title: title)
             hide(activatePrevious: false)
             isPicking = false
             return
         }
+        let targetFrame = Self.contentLocalRect(forSourceCGFrame: tile.window.frame, overlayWindow: w)
 
         suspendFrames()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         tile.highlight = .none
-        tile.layer.zPosition = 1
+        // Float above all other tiles during the flight regardless of
+        // their assigned z-order so the picked tile reads as "the one
+        // being activated."
+        tile.layer.zPosition = 1_000_000
+        // Letter-mode dims non-matching tiles to 0.3 while the user types a
+        // prefix. Snap everyone back to full opacity before the dismiss so
+        // the fly-home animation matches the click path.
+        for t in allTiles { t.layer.opacity = 1.0 }
         CATransaction.commit()
         CATransaction.flush()
 
+        // Every tile flies back to where its window actually lives, so no
+        // fades are needed — each one settles onto its own window. Only the
+        // backdrop fades out.
+        let bg = backgroundLayer
         CATransaction.begin()
-        CATransaction.setAnimationDuration(Self.pickDuration)
+        CATransaction.setAnimationDuration(animationDuration(Self.baseDismissDuration))
         CATransaction.setAnimationTimingFunction(Self.smoothEasing)
-        tile.setFrame(bounds)
-        CATransaction.commit()
-        _ = w
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pickDuration) { [weak self] in
+        // setCompletionBlock fires after the real final frame renders,
+        // not just `duration` ms after we kick the animation off, so we
+        // don't activate while the slide is still moving.
+        CATransaction.setCompletionBlock { [weak self] in
             guard let self else { return }
-            self.hide(activatePrevious: false)
-            self.isPicking = false
+            // Settle: tiles are at their landing spots and the backdrop is
+            // invisible. Hold for a beat so the animation reads as "done"
+            // before any real-window reorder happens.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self else { return }
+                self.raiseAXWindow(pid: pid, windowID: windowID, title: title)
+                if let app = NSRunningApplication(processIdentifier: pid) {
+                    app.activate()
+                }
+                self.raiseAXWindow(pid: pid, windowID: windowID, title: title)
+                // Give WindowServer time to actually reorder before we drop
+                // the overlay; without this the pre-activation window order
+                // flashes through between hide() and activation taking
+                // effect.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    guard let self else { return }
+                    // Skip hide()'s fadeOutAndDown — backdrop is already gone.
+                    self.window?.alphaValue = 0
+                    self.hide(activatePrevious: false)
+                    self.isPicking = false
+                }
+            }
         }
+        for (i, t) in tiles.enumerated() {
+            let dest = (i == selectedIndex)
+                ? targetFrame
+                : Self.contentLocalRect(forSourceCGFrame: t.window.frame, overlayWindow: w)
+            t.setFrame(dest)
+            if i == selectedIndex {
+                // Animate a macOS-style window shadow onto the picked tile
+                // so the system's real drop shadow (which appears the moment
+                // activation runs) blends with what's already painted instead
+                // of popping in around the tile's edges.
+                t.layer.shadowColor = NSColor.black.cgColor
+                t.layer.shadowOpacity = 0.45
+                t.layer.shadowRadius = 22
+                t.layer.shadowOffset = CGSize(width: 0, height: -10)
+            }
+        }
+        bg?.opacity = 0
+        CATransaction.commit()
     }
 
     private func raiseAXWindow(pid: pid_t, windowID: CGWindowID, title: String?) {
@@ -860,12 +954,13 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
 
     private func layoutTilesAnimated() {
         let bounds = window?.contentView?.bounds ?? .zero
+        let duration = animationDuration(Self.baseLayoutDuration)
         suspendFrames()
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.18)
+        CATransaction.setAnimationDuration(duration)
         layoutTiles(in: bounds)
         CATransaction.commit()
-        resumeFrames(after: 0.18)
+        resumeFrames(after: duration)
     }
 
     private func beginZoom() {
@@ -886,9 +981,10 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         }
         savedFrames = tiles.map { $0.layer.frame }
         isZoomed = true
+        let duration = animationDuration(Self.basePeekDuration)
         suspendFrames()
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.12)
+        CATransaction.setAnimationDuration(duration)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
         for (i, t) in tiles.enumerated() {
             if i == selectedIndex {
@@ -903,15 +999,16 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
             }
         }
         CATransaction.commit()
-        resumeFrames(after: 0.12)
+        resumeFrames(after: duration)
     }
 
     private func endZoom() {
         guard isZoomed else { return }
         isZoomed = false
+        let duration = animationDuration(Self.basePeekDuration)
         suspendFrames()
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.12)
+        CATransaction.setAnimationDuration(duration)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
         for (i, t) in tiles.enumerated() {
             if i < savedFrames.count { t.setFrame(savedFrames[i]) }
@@ -923,7 +1020,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
             }
         }
         CATransaction.commit()
-        resumeFrames(after: 0.12)
+        resumeFrames(after: duration)
         savedFrames = []
     }
 
@@ -955,12 +1052,20 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         )
         w.level = .floating
         w.isOpaque = false
-        w.backgroundColor = NSColor.black.withAlphaComponent(0.85)
-        w.isOpaque = false
+        // Backdrop lives on a dedicated CALayer (see backgroundLayer below)
+        // so dismiss can fade it independently of the selected tile.
+        w.backgroundColor = .clear
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let v = OverlayView(frame: frame)
         v.wantsLayer = true
         v.layer?.backgroundColor = .clear
+
+        let bg = CALayer()
+        bg.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
+        bg.frame = v.bounds
+        bg.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        v.layer?.addSublayer(bg)
+        backgroundLayer = bg
         v.keymap = Keymap(overrides: config.bindings)
         v.onAction = { [weak self] action in self?.dispatch(action) }
         v.onSpaceDown = { [weak self] in self?.beginZoom() }

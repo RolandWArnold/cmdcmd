@@ -11,7 +11,7 @@ final class SettingsWindowController: NSWindowController {
     init(config: Config) {
         model = SettingsModel(config: config)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 680),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -28,6 +28,7 @@ final class SettingsWindowController: NSWindowController {
 
 private final class SettingsModel: ObservableObject {
     @Published var animations: Bool { didSet { save() } }
+    @Published var animationSpeed: Double { didSet { save() } }
     @Published var livePreviews: Bool { didSet { save() } }
     @Published var displayMode: DisplayMode { didSet { save() } }
     @Published var letterJump: Bool { didSet { save() } }
@@ -39,6 +40,7 @@ private final class SettingsModel: ObservableObject {
 
     init(config: Config) {
         animations = config.animations
+        animationSpeed = config.animationSpeedOrDefault
         livePreviews = config.livePreviewsEnabled
         displayMode = config.displayModeOrDefault
         letterJump = config.letterJumpEnabled
@@ -50,6 +52,7 @@ private final class SettingsModel: ObservableObject {
     func save() {
         var config = base
         config.animations = animations
+        config.animationSpeed = animationSpeed
         config.livePreviews = livePreviews
         config.displayMode = displayMode
         config.letterJump = letterJump
@@ -58,6 +61,7 @@ private final class SettingsModel: ObservableObject {
         do {
             try Config.patchOnDisk([
                 ("animations", animations ? "true" : "false"),
+                ("animationSpeed", jsonNumber(animationSpeed)),
                 ("livePreviews", livePreviews ? "true" : "false"),
                 ("displayMode", "\"\(displayMode.rawValue)\""),
                 ("letterJump", letterJump ? "true" : "false"),
@@ -71,6 +75,13 @@ private final class SettingsModel: ObservableObject {
             status = "Save failed: \(error.localizedDescription)"
             Log.write("settings save failed: \(error)")
         }
+    }
+
+    private func jsonNumber(_ value: Double) -> String {
+        var s = String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
+        while s.contains(".") && s.last == "0" { s.removeLast() }
+        if s.last == "." { s.removeLast() }
+        return s
     }
 
     func openConfig() {
@@ -101,6 +112,27 @@ private struct SettingsRootView: View {
                 }
             }
             .toggleStyle(.switch)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Animation speed").font(.system(size: 13, weight: .medium))
+                    Spacer()
+                    Text(String(format: "%.2g×", model.animationSpeed))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: $model.animationSpeed, in: 0.25...4.0, step: 0.25) {
+                    Text("Animation speed")
+                } minimumValueLabel: {
+                    Text("0.25×").font(.caption)
+                } maximumValueLabel: {
+                    Text("4×").font(.caption)
+                }
+                Text("1× is normal. Higher values make show, pick, drag-reorder, and peek animations faster.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(!model.animations)
 
             Toggle(isOn: $model.livePreviews) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -171,6 +203,6 @@ private struct SettingsRootView: View {
             }
         }
         .padding(24)
-        .frame(minWidth: 420, minHeight: 580)
+        .frame(minWidth: 420, minHeight: 640)
     }
 }

@@ -58,6 +58,7 @@ Right-click the `⌘ ⌘` Dock icon and pick **Open Config…** — that opens `
 ```json
 {
   "animations": true,
+  "animationSpeed": 1.0,
   "trigger": "cmd-cmd",
   "bindings": {
     "h": "move-left",
@@ -70,6 +71,8 @@ Right-click the `⌘ ⌘` Dock icon and pick **Open Config…** — that opens `
 ```
 
 `animations: false` skips the show / pick zoom transitions.
+
+`animationSpeed` is a multiplier for animated transitions: `1.0` is normal, `2.0` is twice as fast, and `0.5` is half speed.
 
 `trigger` chooses what summons the overlay. Default `"cmd-cmd"` is the both-Command-keys chord. Anything else is treated as a regular hotkey spec — e.g. `"cmd+shift+space"` or `"f13"` (uses the same shortcut grammar as `bindings`). Hotkeys other than the chord require Accessibility permission to be globally observable.
 
@@ -131,7 +134,7 @@ Sources/cmdcmd/
   Overlay.swift       # overlay window, tile grid, selection, animations
   OverlayView.swift   # NSWindow + NSView event router for the overlay
   HintPill.swift      # bottom-center mode-hint label
-  Config.swift        # JSON config loader (animations, trigger, bindings)
+  Config.swift        # JSON config loader (animations, speed, trigger, bindings)
   Keymap.swift        # default shortcuts + override resolver
   HotkeyMonitor.swift # global hotkey trigger (alternative to CmdChord)
   Tile.swift          # per-window SCStream preview layer
