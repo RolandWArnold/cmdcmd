@@ -35,6 +35,28 @@ final class Overlay {
 
     private var paneColors: [CGWindowID: String] = [:]
 
+    // Phase 0 (primitive proof): retained AXUIElement per CGWindowID, captured
+    // while the window is on the current Space. A retained handle stays valid
+    // after the window moves off-Space, so raising it at pick time triggers the
+    // OS Space switch — a fresh AX query can't see off-Space windows. This is a
+    // minimal capture-at-show cache; Phase 1 replaces it with an AXObserver
+    // registry.
+    private static let axCacheLock = NSLock()
+    private static var axElementCache: [CGWindowID: AXUIElement] = [:]
+
+    private static func cachedAXElement(for wid: CGWindowID) -> AXUIElement? {
+        axCacheLock.lock(); defer { axCacheLock.unlock() }
+        return axElementCache[wid]
+    }
+    private static func cacheAXElement(_ el: AXUIElement, for wid: CGWindowID) {
+        axCacheLock.lock(); defer { axCacheLock.unlock() }
+        axElementCache[wid] = el
+    }
+    private static func axCacheCount() -> Int {
+        axCacheLock.lock(); defer { axCacheLock.unlock() }
+        return axElementCache.count
+    }
+
     private struct DragState {
         var index: Int
         var offset: CGPoint
@@ -102,8 +124,11 @@ final class Overlay {
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
-        ) { notification in
+        ) { [weak self] notification in
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            if let self, self.isPicking, self.config.debugLoggingEnabled {
+                Log.write("notify: didActivateApplication DURING pick → \(app.localizedName ?? "?")#\(app.processIdentifier)")
+            }
             Self.recordUse(of: app)
         }
     }
@@ -167,9 +192,13 @@ final class Overlay {
         let t0 = CFAbsoluteTimeGetCurrent()
         let displayBounds = CGDisplayBounds(Self.displayID(for: screen))
         let visibleFrame = screen.visibleFrame
+        let scope = config.windowScopeOrDefault
         let candidates = windows
             .filter(Self.isCapturable)
-            .filter { Self.windowMostlyOn(displayBounds: displayBounds, window: $0) }
+            .filter { Self.passesScopeFilter($0, scope: scope, displayBounds: displayBounds) }
+        if config.debugLoggingEnabled {
+            Log.write("renderOverlay scope=\(scope.rawValue) display=\(Int(displayBounds.width))x\(Int(displayBounds.height)) enumerated=\(windows.count) candidates=\(candidates.count)")
+        }
         let tFilter = CFAbsoluteTimeGetCurrent()
         let createdWindow = window == nil
         let w = window ?? makeWindow(frame: visibleFrame)
@@ -202,9 +231,7 @@ final class Overlay {
         }
         CATransaction.commit()
         let tTiles = CFAbsoluteTimeGetCurrent()
-        w.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        if let v = view { w.makeFirstResponder(v) }
+        presentOverlayWindow(w)
         let tFront = CFAbsoluteTimeGetCurrent()
         animateShow(gridFrames: gridFrames)
         let tEnd = CFAbsoluteTimeGetCurrent()
@@ -216,6 +243,43 @@ final class Overlay {
                          (tEnd - tFront) * 1000,
                          (tEnd - t0) * 1000,
                          candidates.count))
+    }
+
+    /// Bring the overlay to the very front, even over a native full-screen
+    /// Space. Activate the app *first*, then order / raise / key — full-screen
+    /// Spaces are finicky about ordering a window whose owning app isn't active
+    /// yet. Re-asserted once on the next main-loop tick because the first
+    /// attempt can land before the window has joined the Space.
+    private func presentOverlayWindow(_ w: NSWindow) {
+        // EXPERIMENT: order a nonactivating panel WITHOUT activating the app.
+        // NSApp.activate on a regular app forces a switch to cmdcmd's home Space
+        // (the underlying user Space), which was pulling the overlay off the
+        // active full-screen Space. A nonactivating panel can become key and
+        // surface over a full-screen app on the current Space without that.
+        w.level = .screenSaver
+        w.orderFrontRegardless()
+        w.makeKeyAndOrderFront(nil)
+        if let v = view { w.makeFirstResponder(v) }
+        logOverlaySpace(w, tag: "present")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.visible, self.window === w else { return }
+            w.orderFrontRegardless()
+            w.makeKeyAndOrderFront(nil)
+            if let v = self.view { w.makeFirstResponder(v) }
+            self.logOverlaySpace(w, tag: "present(tick2)")
+        }
+    }
+
+    /// Success check for the full-screen presentation experiment: is the
+    /// cmdcmd-owned overlay panel actually on the active (full-screen) Space?
+    /// `nsOnActiveSpace` / `space==activeSpace` true ⇒ it joined the right Space.
+    private func logOverlaySpace(_ w: NSWindow, tag: String) {
+        guard config.debugLoggingEnabled else { return }
+        let wid = CGWindowID(w.windowNumber)
+        let space = tracker.spaceMap(for: [wid])[wid]
+        let active = tracker.activeSpaceID()
+        Log.write("\(tag): overlay wid=\(wid) space=\(space.map(String.init) ?? "-") activeSpace=\(active) nsOnActiveSpace=\(w.isOnActiveSpace) visible=\(w.isVisible) level=\(w.level.rawValue) collection=\(w.collectionBehavior.rawValue) key=\(w.isKeyWindow) main=\(w.isMainWindow) appActive=\(NSApp.isActive) frame=\(Int(w.frame.minX)),\(Int(w.frame.minY)) \(Int(w.frame.width))x\(Int(w.frame.height))")
     }
 
     private static func cursorScreen() -> NSScreen {
@@ -265,10 +329,45 @@ final class Overlay {
     }
 
     private func prepareAndShow(gen: Int, screen: NSScreen) async {
-        let windows = WindowInfo.enumerate()
+        // Scoped enumeration runs here, off the main thread, so the per-window
+        // Space queries (N IPC calls for all-spaces) stay off the show path.
+        let windows = WindowInfo.enumerate(scope: config.windowScopeOrDefault, tracker: tracker)
+        captureAXElements(for: windows)
         await MainActor.run {
             guard self.visible, gen == self.refreshGeneration else { return }
             self.renderOverlay(windows: windows, screen: screen)
+        }
+    }
+
+    /// Capture & retain AXUIElements for windows currently on screen (current
+    /// Space), keyed by CGWindowID. AX can't enumerate off-Space windows, so we
+    /// grab valid handles while they're visible; the retained ref then survives
+    /// the window moving to another Space, giving us something raisable at pick
+    /// time. Runs off the main thread (called from the async show path).
+    private func captureAXElements(for windows: [WindowInfo]) {
+        guard AXIsProcessTrusted() else {
+            if config.debugLoggingEnabled { Log.write("axCapture: skipped — AXIsProcessTrusted()=false (re-grant Accessibility)") }
+            return
+        }
+        let onScreen = windows.filter { $0.isOnScreen && $0.processID != getpid() }
+        let byPid = Dictionary(grouping: onScreen, by: { $0.processID })
+        var captured = 0
+        for (pid, wins) in byPid {
+            let app = AXUIElementCreateApplication(pid)
+            var windowsRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+                  let axWindows = windowsRef as? [AXUIElement] else { continue }
+            let wantWids = Set(wins.map { $0.windowID })
+            for axWin in axWindows {
+                var wid: CGWindowID = 0
+                if _AXUIElementGetWindow(axWin, &wid) == .success, wantWids.contains(wid) {
+                    Self.cacheAXElement(axWin, for: wid)
+                    captured += 1
+                }
+            }
+        }
+        if config.debugLoggingEnabled {
+            Log.write("axCapture: onScreen=\(onScreen.count) captured/updated=\(captured) cacheSize=\(Self.axCacheCount())")
         }
     }
 
@@ -345,6 +444,37 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         let interArea = inter.width * inter.height
         let total = window.frame.width * window.frame.height
         return total > 0 && interArea / total >= 0.5
+    }
+
+    /// Scope-conditional keep/drop, applied after `isCapturable` (§6).
+    /// - `.currentSpace`: classic ≥50%-on-active-display test.
+    /// - `.allSpaces`: the window must have a managed Space of type
+    ///   user/fullscreen/tiled — no managed Space (nil / id 0) means minimized
+    ///   or junk, and system/unknown Spaces are not user-facing, both dropped —
+    ///   then must be relevant to the active display (V1 is single-display, so
+    ///   other-display windows are dropped).
+    private static func passesScopeFilter(_ w: WindowInfo, scope: WindowScope, displayBounds: CGRect) -> Bool {
+        switch scope {
+        case .currentSpace:
+            return windowMostlyOn(displayBounds: displayBounds, window: w)
+        case .allSpaces:
+            guard let type = w.spaceType, (w.spaceID ?? 0) != 0 else { return false }
+            switch type {
+            case .user, .fullscreen, .tiled: break
+            case .system: return false
+            }
+            return windowRelevantToActiveDisplay(displayBounds: displayBounds, window: w)
+        }
+    }
+
+    /// All-Spaces display gate (V1 = active display only). A window is relevant
+    /// when a meaningful part of it overlaps the active display: same-Space and
+    /// off-Space windows on this display share the physical display's
+    /// coordinates so they pass, while windows on another display don't overlap
+    /// and are dropped. Currently identical to `windowMostlyOn`; kept separate
+    /// as the documented knob if full-screen frames ever need looser matching.
+    private static func windowRelevantToActiveDisplay(displayBounds: CGRect, window: WindowInfo) -> Bool {
+        windowMostlyOn(displayBounds: displayBounds, window: window)
     }
 
     private func orderTiles(_ tiles: [Tile]) -> [Tile] {
@@ -624,6 +754,9 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
     }
 
     private func hide(activatePrevious: Bool = true) {
+        if config.debugLoggingEnabled {
+            Log.write("hide(activatePrevious: \(activatePrevious)) isPicking=\(isPicking) prevFrontPID=\(prevFrontPID) front=\(Self.frontDesc())")
+        }
         refreshGeneration &+= 1
         let toStop = allTiles
         for t in toStop { t.suppressFrames = true }
@@ -633,6 +766,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         visible = false
         if activatePrevious, prevFrontPID != 0,
            let app = NSRunningApplication(processIdentifier: prevFrontPID) {
+            if config.debugLoggingEnabled { Log.write("hide: RESTORING previous-front pid=\(prevFrontPID)") }
             app.activate()
         }
         prevFrontPID = 0
@@ -743,14 +877,42 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         prevPickedWindowID = windowID
         isPicking = true
 
-        guard let w = window, config.animations else {
-            raiseAXWindow(pid: pid, windowID: windowID, title: title)
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                app.activate()
-            }
-            raiseAXWindow(pid: pid, windowID: windowID, title: title)
+        // A window that isn't currently on screen lives on a hidden Space, so
+        // activating it must switch Spaces. Its real frame is off this Space, so
+        // the fly-to-source animation can't apply — drop the overlay first, then
+        // force-activate. (7.8 adds a proper off-Space animation.)
+        let crossSpace = !tile.window.isOnScreen
+        if config.debugLoggingEnabled {
+            Log.write("pick: wid=\(windowID) pid=\(pid) app=\(tile.window.applicationName) title=\"\(title ?? "")\" space=\(tile.window.spaceID.map(String.init) ?? "-") type=\(tile.window.spaceType.map { "\($0)" } ?? "-") isOnScreen=\(tile.window.isOnScreen) onActiveSpace=\(tile.window.isOnActiveSpace) crossSpace=\(crossSpace) frontBefore=\(Self.frontDesc())")
+        }
+        if crossSpace {
+            // Order the panel out without restoring the previous (full-screen)
+            // app — prevFrontPID is already 0 and activatePrevious is false, so
+            // no previous-front restoration runs — then switch Space + activate.
+            let targetSpace = tile.window.spaceID
+            let targetDisplay = tile.window.displayUUID
+            window?.alphaValue = 0
             hide(activatePrevious: false)
+            if config.debugLoggingEnabled {
+                Log.write("pick: overlay ordered out (crossSpace); activeSpace(before)=\(tracker.activeSpaceID()) targetSpace=\(targetSpace.map(String.init) ?? "-") targetDisplay=\(targetDisplay ?? "-")")
+            }
+            activateCrossSpacePick(spaceID: targetSpace, displayUUID: targetDisplay, pid: pid, windowID: windowID, title: title)
             isPicking = false
+            return
+        }
+
+        guard let w = window, config.animations else {
+            // Order the panel out BEFORE activating, then activate on the next
+            // main-loop tick — ordering it out *after* activation lets the
+            // non-activating panel's dismissal hand key back to the previous app.
+            window?.alphaValue = 0
+            hide(activatePrevious: false)
+            if config.debugLoggingEnabled { Log.write("pick(no-anim): overlay ordered out, front=\(Self.frontDesc())") }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.raiseAndActivate(pid: pid, windowID: windowID, title: title)
+                self.isPicking = false
+            }
             return
         }
         let targetFrame = Self.contentLocalRect(forSourceCGFrame: tile.window.frame, overlayWindow: w)
@@ -782,25 +944,19 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         // don't activate while the slide is still moving.
         CATransaction.setCompletionBlock { [weak self] in
             guard let self else { return }
-            // Settle: tiles are at their landing spots and the backdrop is
-            // invisible. Hold for a beat so the animation reads as "done"
-            // before any real-window reorder happens.
+            // Hold a beat so the fly-to-window animation reads as "done", then
+            // order the overlay out BEFORE activating. Ordering it out *after*
+            // activation lets the non-activating panel's dismissal hand key back
+            // to the previously-front app (the focus regression). Activate on the
+            // next tick, once the panel is gone, so the target wins for good.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                 guard let self else { return }
-                self.raiseAXWindow(pid: pid, windowID: windowID, title: title)
-                if let app = NSRunningApplication(processIdentifier: pid) {
-                    app.activate()
-                }
-                self.raiseAXWindow(pid: pid, windowID: windowID, title: title)
-                // Give WindowServer time to actually reorder before we drop
-                // the overlay; without this the pre-activation window order
-                // flashes through between hide() and activation taking
-                // effect.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self.window?.alphaValue = 0
+                self.hide(activatePrevious: false)
+                if self.config.debugLoggingEnabled { Log.write("pick(anim): overlay ordered out, front=\(Self.frontDesc())") }
+                DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    // Skip hide()'s fadeOutAndDown — backdrop is already gone.
-                    self.window?.alphaValue = 0
-                    self.hide(activatePrevious: false)
+                    self.raiseAndActivate(pid: pid, windowID: windowID, title: title)
                     self.isPicking = false
                 }
             }
@@ -825,31 +981,144 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         CATransaction.commit()
     }
 
-    private func raiseAXWindow(pid: pid_t, windowID: CGWindowID, title: String?) {
+    private static func axElementAlive(_ el: AXUIElement) -> Bool {
+        var roleRef: CFTypeRef?
+        return AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success
+    }
+
+    /// Focus the picked window, run AFTER the overlay panel is ordered out.
+    /// Uses the SLPS front-process primitive (the one that works cross-Space) +
+    /// an AX raise — NOT NSRunningApplication.activate(), which no-ops here: with
+    /// the non-activating panel, cmdcmd can't cooperatively activate another app,
+    /// so the previous app keeps frontmost. Same-Space (on-screen) windows may
+    /// fall back to a fresh AX lookup; off-Space windows rely on the retained
+    /// element.
+    private func raiseAndActivate(pid: pid_t, windowID: CGWindowID, title: String?) {
+        let debug = config.debugLoggingEnabled
+        if debug { Log.write("focus(before): front=\(Self.frontDesc())") }
+
+        // SLPS front-process forcing + makeKeyWindow events (PrivateFocusFallback
+        // logs the setFront/post result codes internally under debug).
+        PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
+        if debug { Log.write("focus(after SLPS front+makeKeyWindow): front=\(Self.frontDesc())") }
+
+        // AX raise: prefer the retained element (valid even off-Space); a fresh
+        // lookup is fine for an on-screen same-Space window.
+        if let retained = Self.cachedAXElement(for: windowID), Self.axElementAlive(retained) {
+            let ok = applyRaise(app: AXUIElementCreateApplication(pid), win: retained)
+            if debug { Log.write("focus(after AX raise, retained): ok=\(ok) front=\(Self.frontDesc())") }
+        } else {
+            let ok = raiseAXWindow(pid: pid, windowID: windowID, title: title)
+            if debug { Log.write("focus(after AX raise, re-query): ok=\(ok) front=\(Self.frontDesc())") }
+        }
+
+        if debug {
+            for delay in [0.05, 0.15, 0.35] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    Log.write("focus front(+\(delay)): \(Self.frontDesc())")
+                }
+            }
+        }
+    }
+
+    /// Cross-Space pick handler (Phase 0 primitive). Order, per AltTab's focus
+    /// path: SLPS front-process + makeKeyWindow events, then raise the RETAINED
+    /// AX element captured while the window was on-screen. Raising a *valid*
+    /// element is what triggers the OS Space switch out of a full-screen Space —
+    /// a fresh AX query returns empty off-Space (the original wrong turn). The
+    /// unsafe in-process SLS Space switch stays gated off.
+    private func activateCrossSpacePick(spaceID: CGSSpaceID?, displayUUID: String?, pid: pid_t, windowID: CGWindowID, title: String?) {
+        let debug = config.debugLoggingEnabled
+        let trusted = AXIsProcessTrusted()
+        let retained = Self.cachedAXElement(for: windowID)
+        var retainedRole: String?
+        if let retained {
+            var roleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(retained, kAXRoleAttribute as CFString, &roleRef) == .success {
+                retainedRole = roleRef as? String
+            }
+        }
+        let retainedAlive = retainedRole != nil
+        if debug {
+            Log.write("crossSpace pick: wid=\(windowID) pid=\(pid) AXTrusted=\(trusted) retained=\(retained != nil) alive=\(retainedAlive) role=\(retainedRole ?? "-") activeSpace(before)=\(tracker.activeSpaceID()) front(before)=\(Self.frontDesc())")
+        }
+
+        // Experimental in-process SLS Space switch — gated OFF by default.
+        if config.experimentalInProcessSpaceSwitchEnabled, let spaceID {
+            let attempted = PrivateSpaceSwitcher.switchTo(spaceID: spaceID, displayUUID: displayUUID, debug: debug)
+            if debug { Log.write("SpaceSwitch(experimental): attempted=\(attempted)") }
+        }
+
+        // Steps 1+2: force the target process frontmost + post key-window events.
+        PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
+
+        // Step 3 (the fix): raise the RETAINED element. This is what tells the
+        // WindowServer to bring an off-Space / full-screen-Space window forward.
+        if let retained, retainedAlive {
+            let ok = applyRaise(app: AXUIElementCreateApplication(pid), win: retained)
+            if debug { Log.write("crossSpace pick: raised RETAINED element ok=\(ok)") }
+        } else {
+            if debug { Log.write("no retained AX element for wid=\(windowID) (missing or dead) — re-query raise fallback (returns empty off-Space)") }
+            _ = raiseAXWindow(pid: pid, windowID: windowID, title: title)
+        }
+
+        if debug {
+            for delay in [0.05, 0.15, 0.35] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    Log.write("crossSpace pick activeSpace(+\(delay)): \(self.tracker.activeSpaceID()) front=\(Self.frontDesc())")
+                }
+            }
+        }
+    }
+
+    private static func frontDesc() -> String {
+        let f = NSWorkspace.shared.frontmostApplication
+        return "\(f?.localizedName ?? "?")#\(f?.processIdentifier ?? -1)"
+    }
+
+    /// Raise + focus a specific window by CGWindowID (falling back to title).
+    /// Returns whether the focus + raise actions succeeded; logs each AX step.
+    @discardableResult
+    private func raiseAXWindow(pid: pid_t, windowID: CGWindowID, title: String?) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         var windowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let windows = windowsRef as? [AXUIElement] else { return }
+        let listErr = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef)
+        guard listErr == .success, let windows = windowsRef as? [AXUIElement] else {
+            if config.debugLoggingEnabled { Log.write("raiseAX: pid=\(pid) kAXWindows failed err=\(listErr.rawValue)") }
+            return false
+        }
         for win in windows {
             var wid: CGWindowID = 0
             if _AXUIElementGetWindow(win, &wid) == .success, wid == windowID {
-                AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, win)
-                AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementPerformAction(win, kAXRaiseAction as CFString)
-                return
+                let ok = applyRaise(app: app, win: win)
+                if config.debugLoggingEnabled { Log.write("raiseAX: pid=\(pid) wid=\(windowID) match=byID axWindows=\(windows.count) raised=\(ok)") }
+                return ok
             }
         }
-        guard let title, !title.isEmpty else { return }
-        for win in windows {
-            var titleRef: CFTypeRef?
-            AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef)
-            if let t = titleRef as? String, t == title {
-                AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, win)
-                AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
-                AXUIElementPerformAction(win, kAXRaiseAction as CFString)
-                return
+        if let title, !title.isEmpty {
+            for win in windows {
+                var titleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef)
+                if let t = titleRef as? String, t == title {
+                    let ok = applyRaise(app: app, win: win)
+                    if config.debugLoggingEnabled { Log.write("raiseAX: pid=\(pid) wid=\(windowID) match=byTitle axWindows=\(windows.count) raised=\(ok)") }
+                    return ok
+                }
             }
         }
+        if config.debugLoggingEnabled { Log.write("raiseAX: pid=\(pid) wid=\(windowID) NO MATCH axWindows=\(windows.count)") }
+        return false
+    }
+
+    private func applyRaise(app: AXUIElement, win: AXUIElement) -> Bool {
+        let eFocus = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, win)
+        let eMain = AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+        let eRaise = AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+        if config.debugLoggingEnabled, eFocus != .success || eMain != .success || eRaise != .success {
+            Log.write("raiseAX: setFocused=\(eFocus.rawValue) setMain=\(eMain.rawValue) raiseAction=\(eRaise.rawValue)")
+        }
+        return eFocus == .success && eRaise == .success
     }
 
     private func mouseDownAt(_ point: NSPoint) {
@@ -1044,18 +1313,28 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
     }
 
     private func makeWindow(frame: NSRect) -> NSWindow {
-        let w = OverlayWindow(
+        let w = OverlayPanel(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        w.level = .floating
+        // .screenSaver keeps the panel above other content; the real lever for
+        // appearing over a full-screen Space is the nonactivating panel + not
+        // activating the app (see presentOverlayWindow).
+        w.level = .screenSaver
         w.isOpaque = false
+        // We drive show/hide explicitly; don't let the panel vanish when the
+        // app isn't the active app (it never becomes active in this model).
+        w.hidesOnDeactivate = false
+        w.worksWhenModal = true
         // Backdrop lives on a dedicated CALayer (see backgroundLayer below)
         // so dismiss can fade it independently of the selected tile.
         w.backgroundColor = .clear
-        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // canJoinAllSpaces + fullScreenAuxiliary let the panel render over a
+        // full-screen Space; stationary keeps it put across Space transitions;
+        // ignoresCycle hides it from Cmd-` window cycling.
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         let v = OverlayView(frame: frame)
         v.wantsLayer = true
         v.layer?.backgroundColor = .clear

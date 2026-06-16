@@ -1,6 +1,9 @@
 import AppKit
 
-final class OverlayWindow: NSWindow {
+/// Non-activating borderless panel. A nonactivating NSPanel can become key and
+/// render over another app's native full-screen Space without activating cmdcmd
+/// (which would switch to cmdcmd's home Space) — the Spotlight/Alfred model.
+final class OverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }

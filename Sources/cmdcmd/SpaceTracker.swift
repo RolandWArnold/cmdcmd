@@ -71,7 +71,17 @@ final class SpaceTracker {
     }
 
     func windows() -> [SpaceWindow] {
-        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        windows(scope: .currentSpace)
+    }
+
+    /// Enumerate windows for the given scope, each annotated with the Space it
+    /// occupies. `.currentSpace` keeps the on-screen-only set (existing
+    /// behaviour); `.allSpaces` drops `.optionOnScreenOnly` so windows in other
+    /// Spaces and native full-screen Spaces are returned too. Diagnostics path.
+    func windows(scope: WindowScope) -> [SpaceWindow] {
+        let opts: CGWindowListOption = scope == .allSpaces
+            ? [.excludeDesktopElements]
+            : [.optionOnScreenOnly, .excludeDesktopElements]
         guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return [] }
 
         let ids = raw.compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
@@ -103,14 +113,42 @@ final class SpaceTracker {
         CGSGetActiveSpace(cid)
     }
 
+    /// Window→Space accessor for callers building their own per-window metadata
+    /// (e.g. `WindowInfo.enumerate(scope:tracker:)`). Wraps the per-window
+    /// `spacesForWindows` core.
+    func spaceMap(for windowIDs: [CGWindowID]) -> [CGWindowID: CGSSpaceID] {
+        spacesForWindows(windowIDs)
+    }
+
+    /// Space metadata keyed by Space ID, built from the managed-display list.
+    func spaceByID() -> [CGSSpaceID: Space] {
+        Dictionary(spaces().map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    func activeSpaceID() -> CGSSpaceID {
+        activeSpace()
+    }
+
+    /// Map each window to the Space it occupies.
+    ///
+    /// `CGSCopySpacesForWindows` returns the *deduplicated set* of Spaces the
+    /// passed windows occupy, not a parallel one-entry-per-window array. A
+    /// single batch call therefore scrambles the moment two windows share a
+    /// Space (i.e. always), which is why every working consumer (yabai,
+    /// AltTab, asmagill `spaces`) queries one window at a time. We do the same:
+    /// N IPC calls, kept off the main thread by the async enumeration path that
+    /// drives this.
     private func spacesForWindows(_ ids: [CGWindowID]) -> [CGWindowID: CGSSpaceID] {
-        guard !ids.isEmpty else { return [:] }
-        let arr = ids.map { NSNumber(value: $0) } as CFArray
-        let result = CGSCopySpacesForWindows(cid, 0x7, arr)
-        guard let nums = result as? [NSNumber], !nums.isEmpty else { return [:] }
         var map: [CGWindowID: CGSSpaceID] = [:]
-        for (i, id) in ids.enumerated() where i < nums.count {
-            map[id] = nums[i].uint64Value
+        for id in ids {
+            let arr = [NSNumber(value: id)] as CFArray
+            // 0x7 = current | other | user spaces.
+            let result = CGSCopySpacesForWindows(cid, 0x7, arr)
+            guard let nums = result as? [NSNumber], let first = nums.first else { continue }
+            // A sticky (canJoinAllSpaces) window reports multiple Space IDs;
+            // taking .first is an acceptable v1 simplification.
+            let spaceID = first.uint64Value
+            if spaceID != 0 { map[id] = spaceID }
         }
         return map
     }

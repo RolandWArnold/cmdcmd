@@ -144,6 +144,7 @@ func startApp() {
     let fire = {
         overlay.toggle()
         dumpState(tracker: tracker)
+        if appConfig.debugLoggingEnabled { Diagnostics.runEnumeration(tracker: tracker) }
     }
     if appConfig.triggerSpec.lowercased() == "cmd-cmd" {
         trigger = CmdChord(handler: fire)
@@ -171,19 +172,23 @@ NotificationCenter.default.addObserver(
 }
 
 func dumpState(tracker: SpaceTracker) {
+    guard appConfig.debugLoggingEnabled else { return }
     let spaces = tracker.spaces()
     let windows = tracker.windows()
-    print("--- spaces (\(spaces.count)) ---")
+    // Build the dump as one string and route it through Log so it lands in
+    // /tmp/cmdcmd.log. print() only hits stdout, which LaunchServices discards
+    // for an `open`-launched bundle, so the dump was previously unreadable.
+    var out = "--- spaces (\(spaces.count)) ---\n"
     for s in spaces {
         let active = s.isActive ? " *" : ""
-        print("  \(s.id) [\(s.type)] display=\(s.displayUUID.prefix(8))\(active)")
+        out += "  \(s.id) [\(s.type)] display=\(s.displayUUID.prefix(8))\(active)\n"
     }
-    print("--- windows (\(windows.count)) ---")
+    out += "--- windows (\(windows.count)) ---\n"
     for w in windows where !w.ownerName.isEmpty {
         let space = w.spaceID.map(String.init) ?? "-"
-        print("  \(w.windowID) space=\(space) \(w.ownerName) :: \(w.title)")
+        out += "  \(w.windowID) space=\(space) \(w.ownerName) :: \(w.title)\n"
     }
-    fflush(stdout)
+    Log.write(out)
 }
 
 app.run()

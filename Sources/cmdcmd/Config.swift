@@ -21,6 +21,9 @@ struct Config: Codable {
     var letterJump: Bool?
     var usageOrdering: Bool?
     var tilePicks: TilePicks?
+    var windowScope: WindowScope?
+    var debugLogging: Bool?
+    var experimentalInProcessSpaceSwitch: Bool?
 
     var animationSpeedOrDefault: Double {
         guard let animationSpeed, animationSpeed.isFinite else { return 1.0 }
@@ -32,8 +35,18 @@ struct Config: Codable {
     var letterJumpEnabled: Bool { letterJump ?? true }
     var usageOrderingEnabled: Bool { usageOrdering ?? false }
     var tilePicksMode: TilePicks { tilePicks ?? .letters }
+    /// Fork default is all-Spaces: show windows from every Space on the active display.
+    var windowScopeOrDefault: WindowScope { windowScope ?? .allSpaces }
+    /// Honours the CMDCMD_DEBUG=1 environment override in addition to the config flag.
+    var debugLoggingEnabled: Bool {
+        (debugLogging ?? false) || ProcessInfo.processInfo.environment["CMDCMD_DEBUG"] == "1"
+    }
+    /// EXPERIMENTAL, default off. The in-process SLS Space switch desyncs Dock /
+    /// WindowServer state and is not a production path; off-Space picks otherwise
+    /// use a safe focus-only fallback.
+    var experimentalInProcessSpaceSwitchEnabled: Bool { experimentalInProcessSpaceSwitch ?? false }
 
-    static let `default` = Config(animations: true, animationSpeed: nil, trigger: nil, bindings: [:], livePreviews: nil, displayMode: nil, letterJump: nil, usageOrdering: nil, tilePicks: nil)
+    static let `default` = Config(animations: true, animationSpeed: nil, trigger: nil, bindings: [:], livePreviews: nil, displayMode: nil, letterJump: nil, usageOrdering: nil, tilePicks: nil, windowScope: nil, debugLogging: nil, experimentalInProcessSpaceSwitch: nil)
 
     static var fileURL: URL {
         URL(fileURLWithPath: NSHomeDirectory())
@@ -373,6 +386,20 @@ struct Config: Codable {
         lines.append("  // What summons the overlay. \"cmd-cmd\" is the both-Command-keys chord.")
         lines.append("  // Anything else is a normal hotkey: \"cmd+shift+space\", \"f13\", etc.")
         lines.append("  \"trigger\": \"cmd-cmd\",")
+        lines.append("")
+        lines.append("  // Which windows to show. \"all-spaces\" (default) shows windows from every")
+        lines.append("  // Space on the active display, including native full-screen Spaces.")
+        lines.append("  // \"current-space\" restores the classic single-Space behaviour.")
+        lines.append("  \"windowScope\": \"all-spaces\",")
+        lines.append("")
+        lines.append("  // Verbose enumeration / activation logging to /tmp/cmdcmd.log.")
+        lines.append("  // The CMDCMD_DEBUG=1 environment variable forces this on.")
+        lines.append("  \"debugLogging\": false,")
+        lines.append("")
+        lines.append("  // EXPERIMENTAL — leave false. Switches Spaces in-process for off-Space")
+        lines.append("  // picks; known to desync Dock / WindowServer state. When false, off-Space")
+        lines.append("  // picks use a safe focus-only fallback instead.")
+        lines.append("  \"experimentalInProcessSpaceSwitch\": false,")
         lines.append("")
         lines.append("  // Default key bindings shown below — edit, remove, or add to taste.")
         lines.append("  // Modifier tokens: cmd, shift, opt (or option/alt), ctrl.")
