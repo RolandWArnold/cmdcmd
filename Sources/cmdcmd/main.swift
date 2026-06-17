@@ -127,7 +127,9 @@ _ = try? Config.ensureExists()
 var appConfig = Config.load()
 appDelegate.applyDisplayMode(appConfig.displayModeOrDefault)
 let tracker = SpaceTracker()
-let overlay = Overlay(tracker: tracker, config: appConfig)
+let axRegistry = WindowAXRegistry(debug: { appConfig.debugLoggingEnabled })
+let axObservers = WindowAXObservers(registry: axRegistry, debug: { appConfig.debugLoggingEnabled })
+let overlay = Overlay(tracker: tracker, config: appConfig, registry: axRegistry)
 var trigger: AnyObject?
 
 appDelegate.settingsFactory = {
@@ -141,10 +143,40 @@ appDelegate.settingsFactory = {
 }
 
 func startApp() {
+    // 1A: startup identity + trust snapshot, off-main so it never delays launch.
+    if appConfig.debugLoggingEnabled {
+        DispatchQueue.global(qos: .utility).async { Diagnostics.logStartup() }
+    }
+    // Phase B: seed the AX registry (launch backfill, off-main) and begin
+    // activation-driven scans. Show-time capture continues to feed it too.
+    axRegistry.startPopulation()
+    // Phase C: per-app AXObservers — retain windows at creation / focus time so
+    // off-Space / full-screen targets have a retained handle at pick time even
+    // when they were never shown in the overlay. Gated by a config kill-switch;
+    // must run on main (run-loop sources attach to the main run loop).
+    if appConfig.windowObserversEnabled {
+        axObservers.start()
+    }
     let fire = {
         overlay.toggle()
-        dumpState(tracker: tracker)
-        if appConfig.debugLoggingEnabled { Diagnostics.runEnumeration(tracker: tracker) }
+        // 1F: keep the heavy diagnostics (CGWindowList + per-window Space IPC +
+        // the AX backfill probe) OFF the synchronous trigger path. Previously
+        // dumpState + runEnumeration ran inline here, blocking the main run loop
+        // between trigger and the async present/focus — so enabling debug
+        // perturbed the very timing under measurement. Dispatched to a background
+        // queue, turning debug on changes what's logged, not trigger → present →
+        // pick timing.
+        if appConfig.debugLoggingEnabled {
+            // Snapshot AppKit/main-thread-only display state HERE, on-main, into a
+            // plain value type — cheap reads, not the heavy enumeration — so the
+            // background work below touches no NSScreen / NSEvent off-main.
+            let display = Diagnostics.snapshotDisplay()
+            DispatchQueue.global(qos: .utility).async {
+                dumpState(tracker: tracker)
+                Diagnostics.runEnumeration(tracker: tracker, display: display)
+                Diagnostics.runBackfillProbe(tracker: tracker)
+            }
+        }
     }
     if appConfig.triggerSpec.lowercased() == "cmd-cmd" {
         trigger = CmdChord(handler: fire)

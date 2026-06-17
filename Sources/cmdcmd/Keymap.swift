@@ -33,7 +33,7 @@ enum Action: String, Codable, Hashable {
     var doc: String {
         switch self {
         case .pick:         return "Pick the highlighted tile"
-        case .dismiss:      return "Close the overlay (or zoom into the highlighted tile if a selection is active)"
+        case .dismiss:      return "Close the overlay"
         case .moveLeft:     return "Move selection left"
         case .moveRight:    return "Move selection right"
         case .moveUp:       return "Move selection up"

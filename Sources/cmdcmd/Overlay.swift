@@ -1,8 +1,5 @@
 import AppKit
 
-@_silgen_name("_AXUIElementGetWindow")
-private func _AXUIElementGetWindow(_ axEl: AXUIElement, _ wid: UnsafeMutablePointer<CGWindowID>) -> AXError
-
 final class Overlay {
     private var window: NSWindow?
     private var view: OverlayView?
@@ -20,6 +17,7 @@ final class Overlay {
     private var dragState: DragState?
     private var lastLetterJump: String?
     private let tracker: SpaceTracker
+    private let registry: WindowAXRegistry
     private var config: Config
 
     func updateConfig(_ config: Config) {
@@ -35,27 +33,10 @@ final class Overlay {
 
     private var paneColors: [CGWindowID: String] = [:]
 
-    // Phase 0 (primitive proof): retained AXUIElement per CGWindowID, captured
-    // while the window is on the current Space. A retained handle stays valid
-    // after the window moves off-Space, so raising it at pick time triggers the
-    // OS Space switch — a fresh AX query can't see off-Space windows. This is a
-    // minimal capture-at-show cache; Phase 1 replaces it with an AXObserver
-    // registry.
-    private static let axCacheLock = NSLock()
-    private static var axElementCache: [CGWindowID: AXUIElement] = [:]
-
-    private static func cachedAXElement(for wid: CGWindowID) -> AXUIElement? {
-        axCacheLock.lock(); defer { axCacheLock.unlock() }
-        return axElementCache[wid]
-    }
-    private static func cacheAXElement(_ el: AXUIElement, for wid: CGWindowID) {
-        axCacheLock.lock(); defer { axCacheLock.unlock() }
-        axElementCache[wid] = el
-    }
-    private static func axCacheCount() -> Int {
-        axCacheLock.lock(); defer { axCacheLock.unlock() }
-        return axElementCache.count
-    }
+    // Retained AXUIElements live in `WindowAXRegistry` (injected). Phase A0 feeds
+    // it only from the show-time capture path, exactly as the old static
+    // axElementCache did; the registry adds use-time validation + logging and is
+    // the seam later phases grow (launch backfill, activation scans, observers).
 
     private struct DragState {
         var index: Int
@@ -109,8 +90,9 @@ final class Overlay {
         usageOrder = order
     }
 
-    init(tracker: SpaceTracker, config: Config) {
+    init(tracker: SpaceTracker, config: Config, registry: WindowAXRegistry) {
         self.tracker = tracker
+        self.registry = registry
         self.config = config
         workspaceObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
@@ -145,26 +127,41 @@ final class Overlay {
     }
 
     func toggle() {
+        if config.debugLoggingEnabled {
+            Log.write("command action=toggle visible=\(visible) NSApp.isActive=\(NSApp.isActive)")
+        }
         if visible {
             if NSApp.isActive {
+                if config.debugLoggingEnabled { Log.write("toggle: visible & NSApp.isActive=true → dismiss()") }
                 dismiss()
             } else {
+                // Phase 1 point 5: INSTRUMENT ONLY — behavior unchanged. This is
+                // the "toggle() trap": NSApp.activate on a non-activating panel can
+                // pull the overlay off a full-screen Space. The log records whether
+                // the cold-start repro actually reaches this branch; the proposed
+                // non-activating reassertion is deferred until the logs confirm it.
+                if config.debugLoggingEnabled { Log.write("toggle: visible & NSApp.isActive=false → REASSERT branch (NSApp.activate+makeKey) [toggle-trap candidate REACHED]") }
                 NSApp.activate(ignoringOtherApps: true)
                 window?.makeKeyAndOrderFront(nil)
                 if let v = view { window?.makeFirstResponder(v) }
             }
         } else {
+            if config.debugLoggingEnabled { Log.write("toggle: not visible → show()") }
             show()
         }
     }
 
+    /// Close the overlay — NEVER a pick. Escape and trigger re-press both land
+    /// here; committing the highlighted tile is reserved for the explicit paths
+    /// (`.pick` / number key / click / letter match) which call `pick()` directly.
+    /// `hide()` restores focus to the previously-front app, so this is a true cancel.
     private func dismiss() {
         guard visible, !isPicking else { return }
-        if tiles.indices.contains(selectedIndex) {
-            pick()
-        } else {
-            hide()
+        if config.debugLoggingEnabled {
+            let hl = tiles.indices.contains(selectedIndex) ? String(CGWindowID(tiles[selectedIndex].window.windowID)) : "-"
+            Log.write("dismiss → hide (no pick) highlightedWID=\(hl)")
         }
+        hide()
     }
 
     private func show() {
@@ -243,6 +240,24 @@ final class Overlay {
                          (tEnd - tFront) * 1000,
                          (tEnd - t0) * 1000,
                          candidates.count))
+        // 1B: per-tile facts, dispatched off-main AFTER present so the AX
+        // aliveness IPC per tile never delays the trigger → present path.
+        if config.debugLoggingEnabled {
+            let snapshot = candidates
+            DispatchQueue.global(qos: .utility).async { [weak self] in self?.logTiles(snapshot) }
+        }
+    }
+
+    /// Phase 1B: identity + Space metadata + retained-AX state for each tile, to
+    /// pin down which windows lack a cached AX handle at cold start. Runs off the
+    /// main thread (dispatched after present) — AX queries here are read-only and
+    /// must not perturb trigger → present timing.
+    private func logTiles(_ windows: [WindowInfo]) {
+        for w in windows {
+            let wid = CGWindowID(w.windowID)
+            let (_, aliveDesc) = Self.axAliveness(registry.peek(for: wid)?.element)
+            Log.write("tile: wid=\(wid) pid=\(w.processID) app=\(w.applicationName) title=\"\(w.title ?? "")\" isOnScreen=\(w.isOnScreen) space=\(w.spaceID.map(String.init) ?? "-") type=\(w.spaceType.map { "\($0)" } ?? "-") display=\(w.displayUUID ?? "-") \(aliveDesc)")
+        }
     }
 
     /// Bring the overlay to the very front, even over a native full-screen
@@ -349,6 +364,7 @@ final class Overlay {
             if config.debugLoggingEnabled { Log.write("axCapture: skipped — AXIsProcessTrusted()=false (re-grant Accessibility)") }
             return
         }
+        let debug = config.debugLoggingEnabled
         let onScreen = windows.filter { $0.isOnScreen && $0.processID != getpid() }
         let byPid = Dictionary(grouping: onScreen, by: { $0.processID })
         var captured = 0
@@ -357,17 +373,17 @@ final class Overlay {
             var windowsRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
                   let axWindows = windowsRef as? [AXUIElement] else { continue }
-            let wantWids = Set(wins.map { $0.windowID })
+            let infoByWid = Dictionary(wins.map { ($0.windowID, $0) }, uniquingKeysWith: { a, _ in a })
             for axWin in axWindows {
                 var wid: CGWindowID = 0
-                if _AXUIElementGetWindow(axWin, &wid) == .success, wantWids.contains(wid) {
-                    Self.cacheAXElement(axWin, for: wid)
+                if _AXUIElementGetWindow(axWin, &wid) == .success, let info = infoByWid[wid] {
+                    registry.store(element: axWin, wid: wid, pid: pid, bundleID: info.bundleIdentifier, title: info.title, source: .showCapture, debug: debug)
                     captured += 1
                 }
             }
         }
-        if config.debugLoggingEnabled {
-            Log.write("axCapture: onScreen=\(onScreen.count) captured/updated=\(captured) cacheSize=\(Self.axCacheCount())")
+        if debug {
+            Log.write("axCapture: onScreen=\(onScreen.count) captured/updated=\(captured) registrySize=\(registry.count)")
         }
     }
 
@@ -665,6 +681,10 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
     }
 
     private func dispatch(_ action: Action) {
+        if config.debugLoggingEnabled {
+            let hl = tiles.indices.contains(selectedIndex) ? String(CGWindowID(tiles[selectedIndex].window.windowID)) : "-"
+            Log.write("command action=\(action.rawValue) highlightedWID=\(hl) sel=\(selectedIndex)/\(tiles.count) pickBuffer=\(pickBuffer.isEmpty ? "-" : pickBuffer) search=\(searchQuery.isEmpty ? "-" : "active") zoomed=\(isZoomed)")
+        }
         switch action {
         case .pick: pick()
         case .dismiss:
@@ -821,7 +841,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         guard tiles.indices.contains(n) else { return }
         selectedIndex = n
         updateSelection()
-        pick()
+        pick(via: "pickIndex")
     }
 
     private func layoutTiles(in bounds: NSRect) {
@@ -867,12 +887,13 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         updateSelection()
     }
 
-    private func pick() {
+    private func pick(via: String = "pick") {
         guard tiles.indices.contains(selectedIndex), !isPicking else { return }
         let tile = tiles[selectedIndex]
         let pid = tile.ownerPID
         let windowID = CGWindowID(tile.window.windowID)
         let title = tile.window.title
+        let targetSpace = tile.window.spaceID
         prevFrontPID = 0
         prevPickedWindowID = windowID
         isPicking = true
@@ -883,20 +904,22 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         // force-activate. (7.8 adds a proper off-Space animation.)
         let crossSpace = !tile.window.isOnScreen
         if config.debugLoggingEnabled {
-            Log.write("pick: wid=\(windowID) pid=\(pid) app=\(tile.window.applicationName) title=\"\(title ?? "")\" space=\(tile.window.spaceID.map(String.init) ?? "-") type=\(tile.window.spaceType.map { "\($0)" } ?? "-") isOnScreen=\(tile.window.isOnScreen) onActiveSpace=\(tile.window.isOnActiveSpace) crossSpace=\(crossSpace) frontBefore=\(Self.frontDesc())")
+            Log.write("pick: via=\(via) wid=\(windowID) pid=\(pid) app=\(tile.window.applicationName) title=\"\(title ?? "")\" space=\(tile.window.spaceID.map(String.init) ?? "-") type=\(tile.window.spaceType.map { "\($0)" } ?? "-") isOnScreen=\(tile.window.isOnScreen) onActiveSpace=\(tile.window.isOnActiveSpace) crossSpace=\(crossSpace) frontBefore=\(Self.frontDesc())")
+            // 1C: trust + retained state captured BEFORE any focus mechanism runs.
+            let (_, aliveDesc) = Self.axAliveness(registry.peek(for: windowID)?.element)
+            Log.write("pick(trust): crossSpace=\(crossSpace) AXTrusted=\(AXIsProcessTrusted()) \(aliveDesc)")
         }
         if crossSpace {
             // Order the panel out without restoring the previous (full-screen)
             // app — prevFrontPID is already 0 and activatePrevious is false, so
             // no previous-front restoration runs — then switch Space + activate.
-            let targetSpace = tile.window.spaceID
             let targetDisplay = tile.window.displayUUID
             window?.alphaValue = 0
             hide(activatePrevious: false)
             if config.debugLoggingEnabled {
                 Log.write("pick: overlay ordered out (crossSpace); activeSpace(before)=\(tracker.activeSpaceID()) targetSpace=\(targetSpace.map(String.init) ?? "-") targetDisplay=\(targetDisplay ?? "-")")
             }
-            activateCrossSpacePick(spaceID: targetSpace, displayUUID: targetDisplay, pid: pid, windowID: windowID, title: title)
+            activateCrossSpacePick(spaceID: targetSpace, displayUUID: targetDisplay, pid: pid, windowID: windowID)
             isPicking = false
             return
         }
@@ -910,7 +933,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
             if config.debugLoggingEnabled { Log.write("pick(no-anim): overlay ordered out, front=\(Self.frontDesc())") }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.raiseAndActivate(pid: pid, windowID: windowID, title: title)
+                self.raiseAndActivate(pid: pid, windowID: windowID, title: title, targetSpace: targetSpace)
                 self.isPicking = false
             }
             return
@@ -956,7 +979,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
                 if self.config.debugLoggingEnabled { Log.write("pick(anim): overlay ordered out, front=\(Self.frontDesc())") }
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.raiseAndActivate(pid: pid, windowID: windowID, title: title)
+                    self.raiseAndActivate(pid: pid, windowID: windowID, title: title, targetSpace: targetSpace)
                     self.isPicking = false
                 }
             }
@@ -981,9 +1004,17 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
         CATransaction.commit()
     }
 
-    private static func axElementAlive(_ el: AXUIElement) -> Bool {
+    /// Aliveness probe for a retained AX element. Returns whether it's alive
+    /// plus a description naming the actual AX op and its `AXError` — so debug
+    /// logs show *why* an element is considered dead, not a bare boolean
+    /// (Phase 1 point 4). Shared by per-tile (1B), pick() (1C), and both focus
+    /// paths (1D).
+    private static func axAliveness(_ el: AXUIElement?) -> (alive: Bool, desc: String) {
+        guard let el else { return (false, "retained=absent") }
         var roleRef: CFTypeRef?
-        return AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success
+        let err = AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
+        let role = (roleRef as? String) ?? "-"
+        return (err == .success, "retained=present aliveOp=AXCopyAttr(kAXRole) err=\(err.rawValue) alive=\(err == .success) role=\(role)")
     }
 
     /// Focus the picked window, run AFTER the overlay panel is ordered out.
@@ -993,54 +1024,54 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
     /// so the previous app keeps frontmost. Same-Space (on-screen) windows may
     /// fall back to a fresh AX lookup; off-Space windows rely on the retained
     /// element.
-    private func raiseAndActivate(pid: pid_t, windowID: CGWindowID, title: String?) {
+    private func raiseAndActivate(pid: pid_t, windowID: CGWindowID, title: String?, targetSpace: CGSSpaceID?) {
         let debug = config.debugLoggingEnabled
+        let activeSpaceBefore = tracker.activeSpaceID()
         if debug { Log.write("focus(before): front=\(Self.frontDesc())") }
 
         // SLPS front-process forcing + makeKeyWindow events (PrivateFocusFallback
         // logs the setFront/post result codes internally under debug).
-        PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
-        if debug { Log.write("focus(after SLPS front+makeKeyWindow): front=\(Self.frontDesc())") }
+        let slpsOK = PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
+        if debug { Log.write("focus: SLPS.raise ran=true result=\(slpsOK) front=\(Self.frontDesc())") }
 
-        // AX raise: prefer the retained element (valid even off-Space); a fresh
-        // lookup is fine for an on-screen same-Space window.
-        if let retained = Self.cachedAXElement(for: windowID), Self.axElementAlive(retained) {
+        // AX raise: prefer the registry's validated retained element (valid even
+        // off-Space); a fresh lookup is fine for an on-screen same-Space window.
+        // (registry logs hit/miss/invalid.)
+        if let retained = registry.retainedElementForRaise(for: windowID, debug: debug) {
             let ok = applyRaise(app: AXUIElementCreateApplication(pid), win: retained)
-            if debug { Log.write("focus(after AX raise, retained): ok=\(ok) front=\(Self.frontDesc())") }
+            if debug { Log.write("focus: retainedRaise ran=true result=\(ok); freshRaise ran=false front=\(Self.frontDesc())") }
         } else {
             let ok = raiseAXWindow(pid: pid, windowID: windowID, title: title)
-            if debug { Log.write("focus(after AX raise, re-query): ok=\(ok) front=\(Self.frontDesc())") }
+            if debug { Log.write("focus: retainedRaise ran=false; freshRaise ran=true result=\(ok) front=\(Self.frontDesc())") }
         }
 
+        // Same-Space window-level instrumentation (debug-only, read-only). No
+        // retry here — same-Space is reliable and stays unchanged functionally.
         if debug {
-            for delay in [0.05, 0.15, 0.35] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                    Log.write("focus front(+\(delay)): \(Self.frontDesc())")
-                }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.pickVerifyDelay) { [weak self] in
+                _ = self?.settleOutcome(pid: pid, windowID: windowID, tag: "sameSpace settle", activeSpaceBefore: activeSpaceBefore, targetSpace: targetSpace, debug: true)
             }
         }
     }
 
-    /// Cross-Space pick handler (Phase 0 primitive). Order, per AltTab's focus
-    /// path: SLPS front-process + makeKeyWindow events, then raise the RETAINED
-    /// AX element captured while the window was on-screen. Raising a *valid*
-    /// element is what triggers the OS Space switch out of a full-screen Space —
-    /// a fresh AX query returns empty off-Space (the original wrong turn). The
-    /// unsafe in-process SLS Space switch stays gated off.
-    private func activateCrossSpacePick(spaceID: CGSSpaceID?, displayUUID: String?, pid: pid_t, windowID: CGWindowID, title: String?) {
+    /// Cross-Space pick handler. SLPS front-process + key-window events is the
+    /// PRIMARY mechanism — log analysis shows it alone drives the Space switch to
+    /// a desktop target, even cold with no retained AX element, and no datapoint
+    /// shows retained AX rescuing an SLPS-alone failure. A live retained element,
+    /// when present, gets an optional follow-up raise (window-level nicety). A
+    /// missing retained handle is NOT fatal (logged `retained-missing-slps-only`);
+    /// fresh AX is off-Space-blind so it's used only as a read-only diagnostic,
+    /// never relied upon. A single late, frontmost-PID-gated safety-net retry runs
+    /// after the transition settles. The unsafe in-process SLS Space switch stays
+    /// gated off; switching *into* a native full-screen target is a known
+    /// limitation under these constraints, not retried here.
+    private func activateCrossSpacePick(spaceID: CGSSpaceID?, displayUUID: String?, pid: pid_t, windowID: CGWindowID) {
         let debug = config.debugLoggingEnabled
+        let activeSpaceBefore = tracker.activeSpaceID()
         let trusted = AXIsProcessTrusted()
-        let retained = Self.cachedAXElement(for: windowID)
-        var retainedRole: String?
-        if let retained {
-            var roleRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(retained, kAXRoleAttribute as CFString, &roleRef) == .success {
-                retainedRole = roleRef as? String
-            }
-        }
-        let retainedAlive = retainedRole != nil
+        let (_, aliveDesc) = Self.axAliveness(registry.peek(for: windowID)?.element)
         if debug {
-            Log.write("crossSpace pick: wid=\(windowID) pid=\(pid) AXTrusted=\(trusted) retained=\(retained != nil) alive=\(retainedAlive) role=\(retainedRole ?? "-") activeSpace(before)=\(tracker.activeSpaceID()) front(before)=\(Self.frontDesc())")
+            Log.write("crossSpace pick: wid=\(windowID) pid=\(pid) AXTrusted=\(trusted) \(aliveDesc) activeSpace(before)=\(activeSpaceBefore) front(before)=\(Self.frontDesc())")
         }
 
         // Experimental in-process SLS Space switch — gated OFF by default.
@@ -1049,24 +1080,195 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
             if debug { Log.write("SpaceSwitch(experimental): attempted=\(attempted)") }
         }
 
-        // Steps 1+2: force the target process frontmost + post key-window events.
-        PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
+        // Focus primitive, A/B-switched by crossSpaceTargetActivate (SLPS vs
+        // target-app activation), followed by the optional retained-AX correction.
+        issueCrossSpaceFocus(pid: pid, windowID: windowID, tag: "crossSpace pick", debug: debug)
 
-        // Step 3 (the fix): raise the RETAINED element. This is what tells the
-        // WindowServer to bring an off-Space / full-screen-Space window forward.
-        if let retained, retainedAlive {
-            let ok = applyRaise(app: AXUIElementCreateApplication(pid), win: retained)
-            if debug { Log.write("crossSpace pick: raised RETAINED element ok=\(ok)") }
+        // Window-level instrumentation + the single late safety-net retry,
+        // scheduled past the Space-transition settle so it can't interrupt an
+        // in-flight switch.
+        scheduleCrossSpaceVerify(pid: pid, windowID: windowID, activeSpaceBefore: activeSpaceBefore, targetSpace: spaceID)
+    }
+
+    /// The cross-Space focus primitive, A/B-switched by `crossSpaceTargetActivate`.
+    /// flag OFF → SLPS front-process (the current/default path). flag ON →
+    /// experiment #5's cooperative-activation handoff: self-activate cmdcmd (to
+    /// gain activation provenance), then `target.activate()`, then (shared) the
+    /// retained-AX raise; SLPS fallback if the target hand-off is refused so cmdcmd
+    /// isn't left frontmost. The self-activation is the deliberate, gated exception
+    /// to "no NSApp.activate" — it runs at the pick hand-off (overlay already
+    /// hidden), not for overlay presentation. Used by both the initial pick and the
+    /// late retry so the A/B stays consistent; a missing retained handle is not
+    /// fatal (read-only fresh-AX probe under debug).
+    private func issueCrossSpaceFocus(pid: pid_t, windowID: CGWindowID, tag: String, debug: Bool) {
+        if config.crossSpaceTargetActivateEnabled {
+            // #5: a never-active accessory's bare target.activate() is refused by
+            // Sonoma (result=false, front unchanged). Self-activate cmdcmd FIRST to
+            // gain provenance, THEN hand off to the target. If still refused, fall
+            // back to SLPS so we don't strand cmdcmd frontmost.
+            NSApp.activate()
+            let app = NSRunningApplication(processIdentifier: pid)
+            let activated = app?.activate() ?? false
+            if debug { Log.write("\(tag): selfActivate→targetActivate cmdcmdActive=\(NSApp.isActive) targetActivate ran=\(app != nil) result=\(activated) front=\(Self.frontDesc())") }
+            if !activated {
+                let slpsOK = PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
+                if debug { Log.write("\(tag): targetActivate refused → SLPS fallback result=\(slpsOK) front=\(Self.frontDesc())") }
+            }
         } else {
-            if debug { Log.write("no retained AX element for wid=\(windowID) (missing or dead) — re-query raise fallback (returns empty off-Space)") }
-            _ = raiseAXWindow(pid: pid, windowID: windowID, title: title)
+            let slpsOK = PrivateFocusFallback.raise(pid: pid, windowID: windowID, debug: debug)
+            if debug { Log.write("\(tag): SLPS.raise ran=true result=\(slpsOK)") }
         }
+        if let retained = registry.retainedElementForRaise(for: windowID, debug: debug) {
+            let ok = applyRaise(app: AXUIElementCreateApplication(pid), win: retained)
+            if debug { Log.write("\(tag): retainedRaise ran=true result=\(ok)") }
+        } else if debug {
+            // Registry miss/invalid (logged by retainedElementForRaise). A0 keeps the
+            // current cross-Space miss behavior: no functional fresh-AX fallback,
+            // just the read-only off-Space resolvability probe.
+            let mode = config.crossSpaceTargetActivateEnabled ? "activate" : "slps"
+            Log.write("\(tag): retained-missing-\(mode)-only")
+            Log.write("\(tag): freshAX off-Space diagnostic (read-only, not relied upon) resolvable=\(Self.freshAXResolvable(pid: pid, windowID: windowID))")
+        }
+    }
 
+    /// Delay before the post-pick verify/retry runs. Deliberately past the
+    /// macOS Space-transition animation: log analysis shows desktop switches
+    /// register frontmost within ~50ms, but re-issuing SLPS mid-animation could
+    /// disrupt an in-flight switch, so the one retry waits until it has settled.
+    private static let pickVerifyDelay: TimeInterval = 0.6
+    /// Early success-latch sample. If the pick is already frontmost+visible here,
+    /// it succeeded and the late retry is suppressed — so a manual switch-away
+    /// later in the settle window is never overridden by a stale reassert.
+    private static let pickEarlySampleDelay: TimeInterval = 0.4
+
+    /// Settle-time classification of a pick. `targetWindowIsOnScreenAfter` is the
+    /// strongest success signal; `activeSpaceChanged` is weaker (the selected
+    /// window may not be the visible one) — enough to suppress the retry, but
+    /// labelled distinctly. The earlier frontmost-PID-only check was too weak:
+    /// SLPS can make the target process frontmost while the active Space never
+    /// transitions, leaving the user stuck behind full-screen.
+    enum PickOutcome: String {
+        case successSpaceMatch = "success-space-match"        // frontmost && activeSpaceAfter == targetSpace
+        case frontmostWrongSpace = "frontmost-wrong-space"    // frontmost, but active Space != targetSpace (or unknown)
+        case wrongFrontmost = "wrong-frontmost"               // front PID is not the target
+
+        /// Functional verdict: only an active-Space match counts as success and
+        /// suppresses the retry. `kCGWindowIsOnscreen` is NOT used here — it
+        /// false-negatives same-Space picks (the window is the focused/main one
+        /// yet reports off-screen), so it's advisory logging only.
+        var suppressesRetry: Bool { self == .successSpaceMatch }
+    }
+
+    /// Compute the pick outcome and (when `debug`) log the full picture, incl.
+    /// window-level fields and the noisy `activeSpace==targetSpace` advisory.
+    /// Read-only.
+    private func settleOutcome(pid: pid_t, windowID: CGWindowID, tag: String, activeSpaceBefore: CGSSpaceID, targetSpace: CGSSpaceID?, debug: Bool) -> PickOutcome {
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+        let frontIsTarget = (frontPID == pid)
+        let activeSpaceAfter = tracker.activeSpaceID()
+        let activeSpaceChanged = activeSpaceAfter != activeSpaceBefore
+        let (onScreenAfter, spaceAfter) = Self.windowState(windowID, tracker: tracker)
+        // Functional verdict = frontmost AND the active Space is now the target
+        // window's Space. on-screen is advisory only (see PickOutcome). Depends on
+        // targetSpace fidelity; a mislabelled targetSpace can read a real success
+        // as frontmost-wrong-space.
+        let spaceMatch = targetSpace.map { $0 == activeSpaceAfter } ?? false
+        let outcome: PickOutcome
+        if !frontIsTarget { outcome = .wrongFrontmost }
+        else if spaceMatch { outcome = .successSpaceMatch }
+        else { outcome = .frontmostWrongSpace }
         if debug {
-            for delay in [0.05, 0.15, 0.35] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self else { return }
-                    Log.write("crossSpace pick activeSpace(+\(delay)): \(self.tracker.activeSpaceID()) front=\(Self.frontDesc())")
+            let app = AXUIElementCreateApplication(pid)
+            let focusedWID = Self.axWindowID(of: app, attribute: kAXFocusedWindowAttribute)
+            let mainWID = Self.axWindowID(of: app, attribute: kAXMainWindowAttribute)
+            var targetIsMain = "?"
+            if let retained = registry.peek(for: windowID)?.element {
+                var mainRef: CFTypeRef?
+                let err = AXUIElementCopyAttributeValue(retained, kAXMainAttribute as CFString, &mainRef)
+                targetIsMain = err == .success ? "\((mainRef as? Bool) ?? false)" : "err=\(err.rawValue)"
+            }
+            Log.write("\(tag): targetPID=\(pid) targetWID=\(windowID) frontPID=\(frontPID) frontIsTarget=\(frontIsTarget) targetSpace=\(targetSpace.map(String.init) ?? "-") activeSpaceBefore=\(activeSpaceBefore) activeSpaceAfter=\(activeSpaceAfter) activeSpaceEqTargetSpace=\(spaceMatch) activeSpaceChanged=\(activeSpaceChanged) targetWindowIsOnScreenAfter(advisory)=\(onScreenAfter) targetWindowSpaceAfter(advisory)=\(spaceAfter.map(String.init) ?? "-") appFocusedWID=\(focusedWID.map(String.init) ?? "-") appMainWID=\(mainWID.map(String.init) ?? "-") targetWindowIsMain=\(targetIsMain) focusOutcome=\(outcome.rawValue)")
+        }
+        return outcome
+    }
+
+    /// Re-enumerate a specific window at settle time: its current on-screen flag
+    /// and Space. `CGWindowListCreateDescriptionFromArray` returns a description
+    /// even for off-screen windows; `kCGWindowIsOnscreen` is absent (→ false)
+    /// when the window isn't on the active Space. The Space is advisory (the
+    /// per-window mapping is unreliable). Read-only.
+    private static func windowState(_ wid: CGWindowID, tracker: SpaceTracker) -> (onScreen: Bool, space: CGSSpaceID?) {
+        let arr = [NSNumber(value: wid)] as CFArray
+        let infos = (CGWindowListCreateDescriptionFromArray(arr) as? [[String: Any]]) ?? []
+        let onScreen = (infos.first?[kCGWindowIsOnscreen as String] as? Bool) ?? false
+        let space = tracker.spaceMap(for: [wid])[wid]
+        return (onScreen, space)
+    }
+
+    /// Resolve the `CGWindowID` behind an app-level AX window attribute
+    /// (`kAXFocusedWindowAttribute` / `kAXMainWindowAttribute`). Read-only.
+    private static func axWindowID(of app: AXUIElement, attribute: String) -> CGWindowID? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, attribute as CFString, &ref) == .success,
+              let value = ref, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        let win = value as! AXUIElement
+        var wid: CGWindowID = 0
+        return _AXUIElementGetWindow(win, &wid) == .success ? wid : nil
+    }
+
+    /// READ-ONLY diagnostic: would a fresh AX query resolve `windowID` right now?
+    /// Mirrors `raiseAXWindow`'s matching but performs NO raise, so it's safe to
+    /// run under debug without changing behavior. Off-Space this returns false
+    /// (AX is blind to off-Space windows) — exactly the fact we want to record.
+    private static func freshAXResolvable(pid: pid_t, windowID: CGWindowID) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else { return false }
+        for win in windows {
+            var wid: CGWindowID = 0
+            if _AXUIElementGetWindow(win, &wid) == .success, wid == windowID { return true }
+        }
+        return false
+    }
+
+    /// Cross-Space verify with an EARLY SUCCESS LATCH, then at most one late
+    /// retry (functional — runs regardless of debug; only detail logging is
+    /// debug-gated).
+    ///
+    /// At `pickEarlySampleDelay` (~0.4s): if the pick is already frontmost+visible
+    /// (`suppressesRetry`), it has succeeded — latch and STOP. This is what keeps
+    /// a manual switch-away later in the settle window from being overridden by a
+    /// stale reassert. Only if the early sample was NOT successful do we schedule
+    /// the late check at `pickVerifyDelay` (~0.6s, past the transition animation),
+    /// which re-evaluates and, only if STILL not successful, re-issues SLPS once
+    /// and raises a live retained element once. No eager retries; no second retry.
+    private func scheduleCrossSpaceVerify(pid: pid_t, windowID: CGWindowID, activeSpaceBefore: CGSSpaceID, targetSpace: CGSSpaceID?) {
+        let debug = config.debugLoggingEnabled
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pickEarlySampleDelay) { [weak self] in
+            guard let self else { return }
+            let early = self.settleOutcome(pid: pid, windowID: windowID, tag: "crossSpace early", activeSpaceBefore: activeSpaceBefore, targetSpace: targetSpace, debug: debug)
+            if early.suppressesRetry {
+                if debug { Log.write("crossSpace verify: early focusOutcome=\(early.rawValue) → latched success, late retry suppressed") }
+                return
+            }
+            // Not yet successful — allow the single late retry, scheduled so it
+            // lands at ~pickVerifyDelay from the original pick.
+            let remaining = max(0, Self.pickVerifyDelay - Self.pickEarlySampleDelay)
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                guard let self else { return }
+                let late = self.settleOutcome(pid: pid, windowID: windowID, tag: "crossSpace settle", activeSpaceBefore: activeSpaceBefore, targetSpace: targetSpace, debug: debug)
+                guard !late.suppressesRetry else {
+                    if debug { Log.write("crossSpace verify: late focusOutcome=\(late.rawValue) → succeeded by settle, no retry") }
+                    return
+                }
+                if debug { Log.write("crossSpace verify: late focusOutcome=\(late.rawValue) → single late retry") }
+                self.issueCrossSpaceFocus(pid: pid, windowID: windowID, tag: "crossSpace retry", debug: debug)
+                if debug {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                        guard let self else { return }
+                        _ = self.settleOutcome(pid: pid, windowID: windowID, tag: "crossSpace verify(post-retry)", activeSpaceBefore: activeSpaceBefore, targetSpace: targetSpace, debug: true)
+                    }
                 }
             }
         }
@@ -1124,7 +1326,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
     private func mouseDownAt(_ point: NSPoint) {
         if isZoomed {
             dragState = nil
-            pick()
+            pick(via: "click")
             return
         }
         guard let i = tiles.firstIndex(where: { $0.layer.frame.contains(point) }) else {
@@ -1188,7 +1390,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
             layoutTilesAnimated()
             updateSelection()
         } else {
-            pick()
+            pick(via: "click")
         }
         dragState = nil
     }
@@ -1376,7 +1578,7 @@ private static func windowMostlyOn(displayBounds: CGRect, window: WindowInfo) ->
             if let idx = tiles.firstIndex(where: { $0 === matches[0] }) {
                 selectedIndex = idx
                 updateSelection()
-                pick()
+                pick(via: "letter")
                 return
             }
         }

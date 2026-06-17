@@ -24,6 +24,8 @@ struct Config: Codable {
     var windowScope: WindowScope?
     var debugLogging: Bool?
     var experimentalInProcessSpaceSwitch: Bool?
+    var crossSpaceTargetActivate: Bool?
+    var windowObservers: Bool?
 
     var animationSpeedOrDefault: Double {
         guard let animationSpeed, animationSpeed.isFinite else { return 1.0 }
@@ -31,7 +33,11 @@ struct Config: Codable {
     }
     var triggerSpec: String { trigger ?? "cmd-cmd" }
     var livePreviewsEnabled: Bool { livePreviews ?? true }
-    var displayModeOrDefault: DisplayMode { displayMode ?? .dock }
+    /// Default is an accessory (menu-bar) presence so the app honours the
+    /// `LSUIElement` agent flag in Info.plist (no Dock / Cmd-Tab). Without an
+    /// accessory default, `applyDisplayMode` would set `.regular` at runtime and
+    /// override `LSUIElement`. `.dock` stays available as an explicit opt-in.
+    var displayModeOrDefault: DisplayMode { displayMode ?? .menuBar }
     var letterJumpEnabled: Bool { letterJump ?? true }
     var usageOrderingEnabled: Bool { usageOrdering ?? false }
     var tilePicksMode: TilePicks { tilePicks ?? .letters }
@@ -45,8 +51,22 @@ struct Config: Codable {
     /// WindowServer state and is not a production path; off-Space picks otherwise
     /// use a safe focus-only fallback.
     var experimentalInProcessSpaceSwitchEnabled: Bool { experimentalInProcessSpaceSwitch ?? false }
+    /// EXPERIMENTAL A/B (default off, currently worse than SLPS). When on, a
+    /// cross-Space pick uses experiment #5's cooperative-activation handoff:
+    /// self-activate cmdcmd (to gain activation provenance), then `target.activate()`,
+    /// then the AX raise — with an SLPS fallback if the target hand-off is refused.
+    /// Tests whether provenance lets Sonoma permit the front-change that a
+    /// never-active accessory's bare `target.activate()` rejected (result=false).
+    /// The self-activation runs at the pick hand-off (overlay already hidden), not
+    /// for overlay presentation. Default-off path is the SLPS front-process primitive.
+    var crossSpaceTargetActivateEnabled: Bool { crossSpaceTargetActivate ?? false }
+    /// Phase C kill-switch (default on). When false, per-app AXObservers and the
+    /// focused-window probes are not installed; the registry still fills from
+    /// show-capture, launch backfill, and activation scans. Toggling needs only a
+    /// restart — no rebuild / re-grant — so it's a cheap disable if observers misbehave.
+    var windowObserversEnabled: Bool { windowObservers ?? true }
 
-    static let `default` = Config(animations: true, animationSpeed: nil, trigger: nil, bindings: [:], livePreviews: nil, displayMode: nil, letterJump: nil, usageOrdering: nil, tilePicks: nil, windowScope: nil, debugLogging: nil, experimentalInProcessSpaceSwitch: nil)
+    static let `default` = Config(animations: true, animationSpeed: nil, trigger: nil, bindings: [:], livePreviews: nil, displayMode: nil, letterJump: nil, usageOrdering: nil, tilePicks: nil, windowScope: nil, debugLogging: nil, experimentalInProcessSpaceSwitch: nil, crossSpaceTargetActivate: nil, windowObservers: nil)
 
     static var fileURL: URL {
         URL(fileURLWithPath: NSHomeDirectory())
@@ -400,6 +420,17 @@ struct Config: Codable {
         lines.append("  // picks; known to desync Dock / WindowServer state. When false, off-Space")
         lines.append("  // picks use a safe focus-only fallback instead.")
         lines.append("  \"experimentalInProcessSpaceSwitch\": false,")
+        lines.append("")
+        lines.append("  // EXPERIMENTAL A/B — leave false (currently worse than SLPS). Cross-Space")
+        lines.append("  // picks self-activate cmdcmd then hand off to the target app (cooperative")
+        lines.append("  // activation), instead of the SLPS front-process path. Diagnostic only.")
+        lines.append("  \"crossSpaceTargetActivate\": false,")
+        lines.append("")
+        lines.append("  // Per-app Accessibility observers (Phase C). Retain windows at")
+        lines.append("  // creation / focus time so cross-Space and full-screen picks work")
+        lines.append("  // without opening the overlay first. Default true; set false to disable")
+        lines.append("  // (restart to apply — no rebuild needed).")
+        lines.append("  \"windowObservers\": true,")
         lines.append("")
         lines.append("  // Default key bindings shown below — edit, remove, or add to taste.")
         lines.append("  // Modifier tokens: cmd, shift, opt (or option/alt), ctrl.")
