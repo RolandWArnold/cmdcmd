@@ -33,7 +33,11 @@ struct Config: Codable {
     }
     var triggerSpec: String { trigger ?? "cmd-cmd" }
     var livePreviewsEnabled: Bool { livePreviews ?? true }
-    var displayModeOrDefault: DisplayMode { displayMode ?? .dock }
+    /// Default is an accessory (menu-bar) presence so the app honours the
+    /// `LSUIElement` agent flag in Info.plist (no Dock / Cmd-Tab). Without an
+    /// accessory default, `applyDisplayMode` would set `.regular` at runtime and
+    /// override `LSUIElement`. `.dock` stays available as an explicit opt-in.
+    var displayModeOrDefault: DisplayMode { displayMode ?? .menuBar }
     var letterJumpEnabled: Bool { letterJump ?? true }
     var usageOrderingEnabled: Bool { usageOrdering ?? false }
     var tilePicksMode: TilePicks { tilePicks ?? .letters }
